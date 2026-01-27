@@ -1,0 +1,3531 @@
+---
+title: "Analysis pipeline for the behavioral and functional MRI data from the semantic Mnemonic Similarity Task"
+output: html_document
+editor_options:
+  chunk_output_type: console
+---
+# Glossary & packages
+
+ENC = Encoding task phase
+REC = Recognition task phase
+RS = repetition suppression (first presentation - repeat)
+PS = pattern separation (hippocampal operation)
+MD = mnemonic discrimination (behavioural correlate)
+LDI = lure discrimination index (proxy of MD)
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(ppcor)
+library(tidyverse)
+library(tidytuesdayR)
+library(readxl)
+library(tidyr)
+library(scales)
+library(ggplot2)
+library(psycho)
+library(ggpubr)
+library(rstatix)
+library(afex)
+library(MuMIn)
+library(lme4)
+library(lmerTest)
+library(ggstatsplot)
+library(sjPlot)
+library(smplot2)
+library(openxlsx)
+library(stats)
+library(performance)
+library(emmeans)
+library(purrr)
+library(broom)
+library(ggpattern)
+library(ggtext)
+library(dplyr)
+library(ppcor)
+library(readr)
+library(stringr)
+library(grid)
+library(gridExtra)
+library(gtable)
+library(patchwork)
+
+theme_set(theme_light())
+
+custom_theme = theme(
+      plot.title = element_text(color="black", size=30, face="bold",  hjust = 0, vjust = 3), #30 for covariate plots
+      axis.text.x = element_text(vjust = 0.5, hjust=0.5, size = 20, face="bold"), #was 16 for other plots besides rec resp rate
+      axis.text.y = element_text(vjust = 0.5, hjust=0.5, size = 20, face="bold"),
+      axis.title.x = element_text(vjust = -2, hjust=0.5, size = 26, face="bold"),
+      axis.title.y = element_text(vjust = 3, hjust=0.5, size = 26, face="bold"),
+      legend.text = element_text(vjust = 0.5, hjust=0.5, size = 22, face="bold"),
+      legend.title = element_text(vjust = 0.5, hjust=0.5, size = 24, face="bold"),
+      strip.text = element_text(vjust = 0.5, hjust=0.5, size = 22, face="bold"),
+      plot.margin = margin(30, 30, 30, 30),
+      panel.grid.major = element_blank(), 
+      panel.grid.minor = element_blank(),
+      panel.background = element_blank(), 
+      axis.line = element_line(colour = "black")
+      )
+
+
+```
+
+
+# Data handling
+
+## Read-in MR
+
+```{r}
+
+semmst_mr_data = read.xlsx("./data/fmri/ses-01/subfield_data_featquery_2025.xlsx")
+
+```
+
+## Preprocess MR
+
+```{r}
+
+semmst_mr_data_filtered = semmst_mr_data %>%
+  dplyr::select(-c(cope_num, query_type, groupanalysis_type)) %>% 
+  dplyr::rename(ID = subject) %>% 
+  mutate(
+    ID = as.factor(ID),
+    space_type = as.factor(space_type),
+    task = as.factor(task),
+    cope_name = as.factor(cope_name),
+    hemisphere = as.factor(hemisphere),
+    roi = as.factor(roi),
+    mask_type = as.factor(mask_type),
+    contrast = as.factor(contrast),
+    cluster = as.factor(cluster),
+    estimate = as.numeric(estimate),
+  )
+
+```
+
+
+## Read-in behavior
+
+```{r}
+
+semmst_behav_data <- read_xlsx("./data/behavioural/smst/smst_mr_behvaioural_grand.xlsx")
+
+```
+
+## Preprocess behavior
+
+```{r}
+
+# Clean and factorize
+semmst_behav_data_filtered <- semmst_behav_data %>%
+  dplyr::rename(ID = participant_id) %>%
+  mutate(ID = factor(str_c("sub-", ID)),
+         task = factor(task, levels = c("enc", "rec")),
+         run = factor(run),
+         trial_type = factor(trial_type),
+         stim_file = factor(stim_file),
+         itemno = factor(itemno),
+         order = factor(order),
+         response = tolower(response),
+         sex = factor(sex, levels = c("male", "female")),
+         handedness = factor(handedness, levels = "R"),
+         response_time = as.numeric(response_time),
+         onset = as.numeric(onset),
+         correctness = factor(correctness)) %>% 
+  filter(ID %in% semmst_mr_data_filtered$ID)
+
+semmst_mr_behav_data_enc <- semmst_behav_data_filtered %>% 
+  filter(task == "enc",
+         trial_type != "FILLER") %>% 
+  mutate(former_type = ifelse(trial_type=="REPEAT", "TARGET", "LURE")) %>%
+  dplyr::select(ID, noun, former_type) %>% 
+  distinct() 
+
+semmst_mr_behav_data_rec <- semmst_behav_data_filtered %>% 
+  filter(task == "rec",
+         !is.na(response)) %>% 
+  left_join(semmst_mr_behav_data_enc, by = c("ID", "noun") ) %>% 
+  mutate(response = factor(response, levels=c("old", "new"))) %>% 
+  mutate(trial_type = factor(trial_type)) %>% 
+  mutate(former_type = factor(former_type)) %>% 
+  mutate(correctness = factor(correctness, levels=c(0,1)))
+
+```
+
+### LDI
+
+```{r}
+semmst_behav_data_rec_filtered = semmst_mr_behav_data_rec %>% 
+  filter(task == "rec") %>%
+  filter(response != "None") %>% 
+  mutate(response = as.factor(response))
+
+semmst_behav_data_rec_wide_dprime = semmst_behav_data_rec_filtered %>% 
+  dplyr::count(ID, trial_type, response) %>% 
+  unite("trial_resp", c("trial_type", "response"), sep = "_") %>% 
+  spread(trial_resp, n) %>% 
+  mutate_at(vars(matches("_")), ~ifelse(is.na(.), 0, .)) %>% 
+  mutate(targ_n = TARGET_new + TARGET_old) %>% 
+  mutate(close_n = CLOSE_new + CLOSE_old) %>% 
+  mutate(distant_n = DISTANT_new + DISTANT_old) %>% 
+  mutate(foil_n = FOIL_new + FOIL_old) %>% 
+  mutate(LURE_old = CLOSE_old + DISTANT_old) %>% 
+  mutate(LURE_new = CLOSE_new + DISTANT_new) %>% 
+  mutate(lure_n = LURE_new + LURE_old)
+
+# Simple recognition - TARG vs FOIL  
+rec_dprime <- psycho::dprime(
+  n_hit = semmst_behav_data_rec_wide_dprime$TARGET_old,
+  n_fa = semmst_behav_data_rec_wide_dprime$FOIL_old,
+  n_miss = semmst_behav_data_rec_wide_dprime$TARGET_new,
+  n_cr = semmst_behav_data_rec_wide_dprime$FOIL_new,
+  n_targets = semmst_behav_data_rec_wide_dprime$targ_n,
+  n_distractors = semmst_behav_data_rec_wide_dprime$foil_n,
+  adjusted = TRUE
+)
+
+# Close lure discrimination - TARG vs CLOSE  
+close_dprime <- psycho::dprime(
+  n_hit = semmst_behav_data_rec_wide_dprime$TARGET_old,
+  n_fa = semmst_behav_data_rec_wide_dprime$CLOSE_old,
+  n_miss = semmst_behav_data_rec_wide_dprime$TARGET_new,
+  n_cr = semmst_behav_data_rec_wide_dprime$CLOSE_new,
+  n_targets = semmst_behav_data_rec_wide_dprime$targ_n,
+  n_distractors = semmst_behav_data_rec_wide_dprime$close_n,
+  adjusted = TRUE
+)
+
+# Distant lure discrimination - TARG vs DISTANT  
+dist_dprime <- psycho::dprime(
+  n_hit = semmst_behav_data_rec_wide_dprime$TARGET_old,
+  n_fa = semmst_behav_data_rec_wide_dprime$DISTANT_old,
+  n_miss = semmst_behav_data_rec_wide_dprime$TARGET_new,
+  n_cr = semmst_behav_data_rec_wide_dprime$DISTANT_new,
+  n_targets = semmst_behav_data_rec_wide_dprime$targ_n,
+  n_distractors = semmst_behav_data_rec_wide_dprime$distant_n,
+  adjusted = TRUE
+)
+
+# All lure discrimination - TARG vs LURE  
+lure_dprime <- psycho::dprime(
+  n_hit = semmst_behav_data_rec_wide_dprime$TARGET_old,
+  n_fa = semmst_behav_data_rec_wide_dprime$LURE_old,
+  n_miss = semmst_behav_data_rec_wide_dprime$TARGET_new,
+  n_cr = semmst_behav_data_rec_wide_dprime$LURE_new,
+  n_targets = semmst_behav_data_rec_wide_dprime$targ_n,
+  n_distractors = semmst_behav_data_rec_wide_dprime$lure_n,
+  adjusted = TRUE
+)
+
+
+semmst_behav_data_rec_summary <- semmst_behav_data_rec_wide_dprime %>% 
+  transmute(
+    ID,
+    
+    # Recognition
+    rec_dprime     = rec_dprime$dprime,
+    rec_correct    = (TARGET_old) / (targ_n),
+    rec_incorrect  = (TARGET_new) / (targ_n),
+    
+    # Close LDI
+    close_dprime   = close_dprime$dprime,
+    close_correct  = (CLOSE_new) / (close_n),
+    close_incorrect= (CLOSE_old) / (close_n),
+    
+    # Distant LDI
+    distant_dprime = dist_dprime$dprime,
+    distant_correct  = (DISTANT_new) / (distant_n),
+    distant_incorrect= (DISTANT_old) / (distant_n),
+    
+    # Lure LDI
+    lure_dprime = lure_dprime$dprime,
+    lure_correct  = (LURE_new) / (lure_n),
+    lure_incorrect= (LURE_old) / (lure_n),
+  )
+
+```
+
+## Merge
+
+```{r}
+
+semmst_merged_data <- semmst_mr_data_filtered %>%
+  left_join(
+    semmst_behav_data_filtered %>%
+      dplyr::select(ID, sex:GRO_score_SES02) %>%
+      distinct(ID, .keep_all = TRUE),
+    by = "ID"
+  ) %>%
+  left_join(semmst_behav_data_rec_summary, by = "ID") %>% 
+  droplevels()
+
+```
+
+## FILTER for HYPOTHESIS TESTING
+
+```{r}
+
+# REPETITION SENSTIVITY
+semmst_merged_data_filtered = semmst_merged_data %>% 
+  filter(contrast %in% c("ENC_ERP_ALLRS")) %>% 
+  filter(space_type == "standard") %>% 
+  filter(voxels > 50) %>% 
+  filter(as.numeric(as.character(cluster)) < 140) %>% 
+  mutate(roi_cluster = paste(hemisphere, roi, cluster, sep = "_")) %>% 
+  mutate(roi_hemisphere = paste(hemisphere, roi, sep = "_")) %>%
+  mutate(Vocabulary_scale = scale(Vocabulary)) %>% 
+  mutate(Digit_Symbol_scale = scale(Digit_Symbol)) %>% 
+  mutate(NonWord_sum_scale = scale(NonWord_sum)) 
+
+# ANATOMY CONTROL
+semmst_merged_data_filtered_anat = semmst_merged_data %>% 
+  filter(contrast %in% c("anatHC")) %>% 
+  mutate(roi_cluster = paste(hemisphere, roi, cluster, sep = "_")) %>% 
+  mutate(roi_hemisphere = paste(hemisphere, roi, sep = "_")) %>%
+  mutate(Vocabulary_scale = scale(Vocabulary)) %>% 
+  mutate(Digit_Symbol_scale = scale(Digit_Symbol)) %>% 
+  mutate(NonWord_sum_scale = scale(NonWord_sum)) 
+
+```
+
+
+# Results
+## Analysis 1 - Behavioural
+
+### ANOVA on LDI
+
+```{r}
+
+semmst_behav_data_rec_LDI_ANCOVA = semmst_behav_data_rec_LDI_ANOVA %>% 
+  left_join(semmst_behav_data_rec_filtered %>%  dplyr::select(ID, age, sex, education, Vocabulary, Digit_Symbol, NonWord_sum) %>% distinct(), by="ID") %>%
+  mutate(Vocabulary_scale = scale(Vocabulary)) %>% 
+  mutate(Digit_Symbol_scale = scale(Digit_Symbol)) %>% 
+  mutate(NonWord_sum_scale = scale(NonWord_sum)) %>% drop_na()
+ 
+# ASSUMPTION CHECKS
+## OUTLIER
+semmst_behav_data_rec_LDI_ANCOVA %>%
+  group_by(dprime_type) %>%
+  identify_outliers(dprime_value)
+
+##NORMALITY
+semmst_behav_data_rec_LDI_ANCOVA %>% 
+  group_by(dprime_type) %>%
+  shapiro_test(dprime_value) %>%  print(n=40)
+
+ggqqplot(semmst_behav_data_rec_LDI_ANCOVA, "dprime_value", ggtheme = theme_bw()) +
+  facet_grid(. ~ dprime_type, labeller = "label_both")
+
+# ANCOVA
+ANCOVA_behav_data_rec_LDI = semmst_behav_data_rec_LDI_ANCOVA %>%
+  anova_test(dv = dprime_value, wid = ID, within = c(dprime_type), covariate = c(sex, age, Vocabulary_scale, Digit_Symbol_scale, NonWord_sum_scale))
+
+get_anova_table(ANCOVA_behav_data_rec_LDI)
+
+# REPORT
+## dprime_type                   174.597      <0.001 ***  0.582000
+## NonWord_sum_scale               8.346      0.008  **   0.229000
+## Digit_Symbol_scale:dprime_type  3.593      0.035  *    0.028000
+
+```
+
+### GLMEM: semantic similarity ~ response
+
+```{r}
+
+semmst_behav_data_rec_filtered_GLMEM <- semmst_behav_data_rec_filtered %>%
+  mutate(across(all_of(c("Vocabulary", "Digit_Symbol", "NonWord_sum", "arousal", "concreteness", "imageability", "meaningfulness")),
+                ~ as.numeric(scale(.x)),           # drop scale() attributes
+                .names = "{.col}_scale")) %>% 
+  drop_na(Vocabulary) %>% 
+  mutate(response = relevel(response, ref = "new"))
+
+semmst_behav_data_rec_filtered_GLMEM_lure = semmst_behav_data_rec_filtered_GLMEM %>% 
+  filter(trial_type %in% c("CLOSE", "DISTANT"))
+
+model_simple_cont = glmer(response ~ cosine * trial_type * former_type +
+                                (1|ID) + 
+                                (1|itemno),
+                                family = binomial("probit"), 
+                                data = semmst_behav_data_rec_filtered_GLMEM_lure,
+                                control = glmerControl(optimizer ='bobyqa', optCtrl=list(maxfun = 20000)), nAGQ=0)
+
+model_complex_cont = glmer(response ~ cosine * trial_type * former_type +
+                                        age + sex + education + Vocabulary_scale + Digit_Symbol_scale +
+                                                  NonWord_sum_scale + arousal_scale + meaningfulness_scale + concreteness_scale +
+                                        (1|ID) + 
+                                        (1|itemno),
+                                        family = binomial("probit"), 
+                                        data = semmst_behav_data_rec_filtered_GLMEM_lure,
+                                        control = glmerControl(optimizer ='bobyqa', optCtrl=list(maxfun = 20000)), nAGQ=0)
+
+anova(model_simple_cont, model_complex_cont)
+summary(model_complex_cont)
+confint(model_complex_cont, parm="beta_", method="Wald")
+
+
+# REPORT                                       Estimate Std. Error z value Pr(>|z|)      2.5 %      97.5 % (Intercept)                               
+## cosine                                      5.131681   1.806091   2.841  0.00449 ** -7.444086424 -0.35150302
+## NonWord_sum_scale                          -0.213690   0.069192  -3.088  0.00201 ** -0.349304360 -0.07807487
+## meaningfulness_scale                        0.145144   0.073066   1.986  0.04698 *  0.001936827  0.28835127
+## trial_typeDISTANT                           2.011234   1.931225   1.041  0.29768   
+## former_typeTARGET                          -1.376078   1.970692  -0.698  0.48501 
+
+```
+
+## Analysis 2 - ENC RS
+
+### ANOVA - REPEAT vs. LURE
+
+```{r}
+# FILTER DATA
+semmst_merged_data_H1 = semmst_merged_data_filtered %>% 
+  filter(task == "Encoding") %>% 
+  filter(cope_name %in% c("LureFirst", "ExactFirst", "LureRepeat", "ExactRepeat")) %>% 
+  extract(
+    col = cope_name,
+    into = c("stim_type", "order"),
+    regex = "([A-Za-z]+?)(First|Repeat)$"
+  ) %>% 
+  mutate(
+    stim_type = as.factor(stim_type),
+    order = as.factor(order)
+  ) %>% 
+  mutate(stim_type = factor(stim_type, levels = c("Exact", "Lure")))
+
+# ASSUMPTION CHECKS
+## OUTLIER
+semmst_merged_data_H1 %>%
+  group_by(stim_type, order, roi_cluster) %>%
+  identify_outliers(estimate) %>% 
+  dplyr::select(ID, is.outlier, is.extreme) %>% 
+  filter(is.extreme==TRUE)
+
+semmst_merged_data_H1_nooutlier = semmst_merged_data_H1 %>%
+  group_by(stim_type, order, roi_cluster) %>%
+  filter(! ID %in% c("sub-434971")) %>%  #, " sub-012421", "sub-632012", "sub-800472")) %>% # c("sub-434971", "sub-982347")) %>%
+  drop_na(NonWord_sum_scale) %>% 
+  ungroup()
+
+##NORMALITY
+semmst_merged_data_H1_nooutlier %>% 
+  group_by(stim_type, order) %>%
+  shapiro_test(estimate)
+
+# ANOVA
+semmst_merged_data_H1_nooutlier_AOV = semmst_merged_data_H1_nooutlier %>%
+  anova_test(dv = estimate, wid = ID, within = c(stim_type, order, roi_cluster), covariate = c(NonWord_sum_scale, Digit_Symbol_scale))
+
+get_anova_table(semmst_merged_data_H1_nooutlier_AOV)
+
+# REPORT                       Effect DFn DFd      F        p p<.05      ges
+## 3                                       stim_type   1  25 16.271 4.54e-04     * 4.50e-02
+## 4                                           order   1  25 50.948 1.76e-07     * 1.41e-01
+## 4                                 stim_type:order   1  25 12.810 1.00e-03     * 3.20e-02
+## 6                               order:roi_cluster   1  25  5.677 2.50e-02     * 6.00e-03
+# COVARIATES
+## 16             Digit_Symbol_scale:stim_type:order   1  25  6.123 2.00e-02     * 1.60e-02
+## 19            NonWord_sum_scale:order:roi_cluster   1  25  9.266 5.00e-03     * 1.00e-02
+
+
+# POST-HOC
+# pairwise comparisons - stim_type * order
+semmst_merged_data_H1_nooutlier_PWC = semmst_merged_data_H1_nooutlier %>%
+  drop_na(Digit_Symbol) %>% 
+  group_by(stim_type) %>% 
+  pairwise_t_test(
+    estimate ~ order, 
+    paired = TRUE,
+    detailed = TRUE,
+    ) %>% 
+  ungroup() %>% 
+#  group_by(stim_type) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance() %>%
+  ungroup() %>% 
+  mutate(label = paste0("p=", signif(p.adj, 3)))
+semmst_merged_data_H1_nooutlier_PWC
+
+# REPORT        estimate .y.      group1 group2    n1    n2 statistic        p    df conf.low conf.high method alternative    p.adj p.adj.signif label 
+## Exact       0.190  estimate First  Repeat    56    56      8.86 3.52e-12    55   0.147      0.232 T-test two.sided   7.04e-12 ****         p=7.04e-12
+## Lure        0.0720 estimate First  Repeat    56    56      3.44 1   e- 3    55   0.0301     0.114 T-test two.sided   2   e- 3 **           p=0.002 
+
+# pairwise comparisons - order * roi_cluster
+semmst_merged_data_H1_nooutlier_PWC = semmst_merged_data_H1_nooutlier %>%
+  drop_na(Digit_Symbol) %>% 
+  group_by(order) %>% 
+  pairwise_t_test(
+    estimate ~ stim_type, 
+    paired = TRUE,
+    detailed = TRUE,
+    ) %>% 
+  ungroup() %>% 
+#  group_by(stim_type) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance() %>%
+  ungroup() %>% 
+  mutate(label = paste0("p=", signif(p.adj, 3)))
+semmst_merged_data_H1_nooutlier_PWC
+
+# REPORT        estimate .y.      group1 group2    n1    n2 statistic          p    df conf.low conf.high method alternative      p.adj p.adj.signif labe 
+## First   -0.0114 estimate Exact  Lure      56    56    -0.734 0.466         55  -0.0427    0.0198 T-test two.sided   0.932      ns           p=0.932   
+## Repeat  -0.129  estimate Exact  Lure      56    56    -5.45  0.00000124    55  -0.176    -0.0815 T-test two.sided   0.00000248 ****         p=2.48e-06
+
+```
+
+
+
+### ANOVA - REPEAT vs. LURE and CORRECT vs. INCORRECT
+
+For subsequent correctness we use those models, where only those runs were included, where non-zero amount of trials were in each bin.
+
+```{r}
+
+semmst_merged_data_filtered_subseq = semmst_merged_data_filtered %>%
+  dplyr::filter(task %in% c("EncodingSubseq", "EncodingSubseq_limited")) %>%
+  dplyr::group_by(ID) %>%
+  dplyr::filter(
+    task == "EncodingSubseq" &
+      !any(task == "EncodingSubseq_limited")
+  ) %>%
+  dplyr::ungroup()
+
+semmst_merged_data_HE = semmst_merged_data_filtered_subseq %>% 
+  filter(cope_name %in% c("CorrectExactRepeat", "CorrectExactFirst", "CorrectLureRepeat", "CorrectLureFirst", "IncorrectExactFirst", "IncorrectExactRepeat", "IncorrectLureFirst", "IncorrectLureRepeat"))
+
+
+```
+
+
+```{r}
+
+# STANDARD
+semmst_merged_data_HE_test = semmst_merged_data_HE %>%
+  extract(col = cope_name,
+          into = c("correctness", "stim_type", "order"),
+          regex = "^(Correct|Incorrect)(Exact|Lure)(First|Repeat)$") %>% 
+  mutate(
+    stim_type = as.factor(stim_type),
+    order = as.factor(order)
+  ) %>% 
+  mutate(stim_type = factor(stim_type, levels = c("Exact", "Lure"))) %>% 
+  mutate(correctness = factor(correctness, levels = c("Correct", "Incorrect"))) %>% 
+  droplevels() 
+
+# ASSUMPTION CHECKS
+## OUTLIER
+semmst_merged_data_HE_test %>%
+  group_by(order, correctness, roi_cluster) %>%
+  identify_outliers(estimate) %>% 
+  dplyr::select(ID, roi_cluster, stim_type, order, correctness, is.outlier, is.extreme) %>% 
+  filter(is.extreme == TRUE)
+
+semmst_merged_data_HE_test_nooutlier = semmst_merged_data_HE_test %>% 
+  #filter(!ID %in% c("sub-434971")) %>%  #, "sub-124846")) %>%  #c("sub-434971", "sub-632012", "sub-680997")) %>%  #, "sub-193800")) %>% 
+  ungroup()
+
+##NORMALITY
+semmst_merged_data_HE_test_nooutlier %>% 
+  group_by(stim_type, order, correctness, roi, hemisphere) %>%
+  shapiro_test(estimate) %>%  print(n=100)
+
+# ANOVA
+semmst_merged_data_HE_test_AOV = semmst_merged_data_HE_test_nooutlier %>% 
+  anova_test(dv = estimate, wid = ID, within = c(stim_type, correctness, order, roi_cluster))#, covariate = c(NonWord_sum_scale))
+
+get_anova_table(semmst_merged_data_HE_test_AOV)
+
+# REPORT
+## 1                                stim_type   1  28 13.459000 1.00e-03     * 1.80e-02
+## 3                                    order   1  28 43.614000 3.66e-07     * 4.60e-02
+## 6                          stim_type:order   1  28  7.165000 1.20e-02     * 1.50e-02
+## 7                        correctness:order   1  28  0.048000 8.28e-01       1.18e-04
+## 11             stim_type:correctness:order   1  28  0.277000 6.03e-01       4.92e-04
+
+# POST-HOC
+# pairwise comparisons
+semmst_merged_data_HE_test_nooutlier_PWC = semmst_merged_data_HE_test_nooutlier %>%
+  group_by(stim_type) %>% 
+  pairwise_t_test(
+    estimate ~ order, 
+    paired = TRUE,
+    detailed = TRUE,
+    ) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance() %>%
+  ungroup() %>% 
+  mutate(label = paste0("p=", signif(p.adj, 3)))
+semmst_merged_data_HE_test_nooutlier_PWC %>% dplyr::select(-c(alternative, method, .y., )) %>%  print(n=50)
+
+# REPORT stim_type estimate group1 group2    n1    n2 statistic             p    df conf.low conf.high        p.adj p.adj.signif label     
+## 1 Exact       0.164  First  Repeat   116   116      6.32 0.00000000513   115  0.112      0.215  0.0000000103 ****         p=1.03e-08
+## 2 Lure        0.0454 First  Repeat   116   116      1.72 0.088           115 -0.00681    0.0975 0.176        ns           p=0.176  
+
+```
+
+
+## Analysis 3 - Power function
+
+### CLOSE vs DISTANT
+
+```{r}
+# FILTER DATA
+semmst_merged_data_H1b = semmst_merged_data_filtered %>% 
+  filter(task == "Encoding") %>% 
+  filter(cope_name %in% c("CloseRepeat", "DistantRepeat"))
+
+# ASSUMPTION CHECKS
+## OUTLIER
+semmst_merged_data_H1b %>%
+  group_by(cope_name, roi_cluster) %>%
+  identify_outliers(estimate) %>% 
+  dplyr::select(ID, is.outlier, is.extreme) %>% 
+  filter(is.extreme==TRUE)
+
+semmst_merged_data_H1b_nooutlier = semmst_merged_data_H1b %>%
+  group_by(cope_name, roi_cluster) %>%
+  filter(! ID %in% c("sub-434971")) %>%  #, " sub-012421", "sub-632012", "sub-800472")) %>% # c("sub-434971", "sub-982347")) %>%
+  ungroup()
+
+##NORMALITY
+semmst_merged_data_H1b_nooutlier %>% 
+  group_by(cope_name) %>%
+  shapiro_test(estimate)
+
+# ANOVA
+semmst_merged_data_H1b_nooutlier_AOV = semmst_merged_data_H1b_nooutlier %>%
+  anova_test(dv = estimate, wid = ID, within = c(cope_name, roi_cluster), covariate = c(NonWord_sum_scale, Digit_Symbol_scale))
+
+get_anova_table(semmst_merged_data_H1b_nooutlier_AOV)
+
+# REPORT                       Effect DFn DFd      F        p p<.05      ges
+## 1             cope_name   1  28 0.111 0.742       7.47e-04
+## 2           roi_cluster   1  28 0.011 0.917       9.52e-05
+## 3 cope_name:roi_cluster   1  28 0.077 0.784       3.99e-04
+
+```
+
+
+### POWER CURVE vs LINEAR
+
+Prepare data - export to MATLAB to use Curve Fitting Toolbox
+
+```{r}
+# FILTER DATA
+semmst_merged_data_H1_clodis_powerfunc = semmst_merged_data_filtered %>% 
+  filter(task == "EncodingFirst") %>% 
+  filter(cope_name %in% c("AllFirst", "CloseRepeat", "DistantRepeat", "ExactRepeat")) %>% 
+  mutate(roi_cluster = paste(hemisphere, roi, cluster, sep = "_")) %>% 
+  mutate(roi_hemisphere = paste(hemisphere, roi, sep = "_")) %>% 
+  mutate(cope_name = factor(cope_name, levels = c("ExactRepeat", "CloseRepeat", "DistantRepeat", "AllFirst"))) %>% 
+  mutate(roi_cluster = factor(roi_cluster))
+
+# OUTLIER
+semmst_merged_data_H1_clodis_powerfunc %>%
+  group_by(cope_name, roi_cluster) %>%
+  identify_outliers(estimate) %>% 
+  dplyr::select(ID, is.outlier, is.extreme) 
+
+semmst_merged_data_H1_clodis_powerfunc_nooutlier = semmst_merged_data_H1_clodis_powerfunc 
+
+## EXPORT TO MATLAB
+export_matlab <- semmst_merged_data_H1_clodis_powerfunc_nooutlier %>%
+  filter(cope_name %in% c("AllFirst","ExactRepeat","CloseRepeat","DistantRepeat")) %>%
+  transmute(
+    Subj = ID,
+    ROI  = as.character(roi_cluster),
+    Cond = as.character(cope_name),
+    Beta = estimate
+  )
+
+write.csv(export_matlab, "derivatives/transfer_raw_matlab.csv", row.names = FALSE)
+
+```
+
+The rest of this analysis is in "scripts/smst_mr1_powerfunction.m"
+
+## Analysis 4 - ENC RS ~ LDI
+
+### Prepare bias scores
+
+```{r}
+group_vars_H3 <- c("ID", "mask_type", "space_type", "contrast", "roi_cluster")
+
+# baseline
+semmst_merged_data_H3_neural_ps = semmst_merged_data_filtered %>% 
+  filter(task %in% c("Encoding")) %>% 
+  filter(cope_name %in% c("ExactFirst", "ExactRepeat", "LureFirst","LureRepeat", "CloseFirst", "CloseRepeat", "DistantFirst", "DistantRepeat")) %>% 
+  dplyr::select(ID, space_type, cope_name, hemisphere, roi, mask_type, cluster, voxels, contrast, task, roi_cluster, roi_hemisphere, estimate, NonWord_sum_scale, Digit_Symbol_scale, rec_dprime:lure_incorrect) %>% 
+  group_by(across(all_of(group_vars_H3))) %>%
+  pivot_wider(names_from = cope_name, values_from = estimate, values_fill = NA_real_) %>%
+  mutate(
+    # --- Non-RS bias scores (Exact denominator) ---
+    LureBiasScore      = LureRepeat - ExactRepeat, 
+    CloseBiasScore     = CloseRepeat - ExactRepeat,
+    DistantBiasScore   = DistantRepeat - ExactRepeat
+  ) %>%
+  ungroup()
+
+```
+
+### Correlation - LURES
+
+```{r}
+
+# 1) Filter / define roi_group
+df_corr_input_all <- semmst_merged_data_H3_neural_ps %>%
+  mutate(roi_group = roi_cluster) %>%
+  dplyr::select(
+    ID, roi_group, roi, hemisphere, cluster, voxels,
+    LureBiasScore, lure_dprime,
+    NonWord_sum_scale, Digit_Symbol_scale
+  ) %>%
+  ungroup()
+
+# 2) Mahalanobis outlier detection (per ROI)
+alpha <- 0.99  # cutoff for chi-square (df=2)
+
+md_tbl_all <- df_corr_input_all %>%
+  dplyr::group_by(roi_group) %>%
+  dplyr::group_modify(~{
+    d <- .x %>% dplyr::select(ID, LureBiasScore, lure_dprime) %>% tidyr::drop_na()
+    if (nrow(d) < 3) {
+      return(tibble::tibble(ID = character(), MD = numeric(), p = numeric(),
+                            cutoff = numeric(), is_outlier = logical()))
+    }
+    X <- as.matrix(d[, c("LureBiasScore", "lure_dprime")])
+    center <- colMeans(X)
+    covmat <- stats::cov(X)
+    md <- stats::mahalanobis(X, center = center, cov = covmat)
+    tibble::tibble(
+      ID = d$ID,
+      MD = md,
+      p  = 1 - stats::pchisq(md, df = 2),
+      cutoff = stats::qchisq(alpha, df = 2),
+      is_outlier = md > stats::qchisq(alpha, df = 2)
+    )
+  }) %>%
+  ungroup()
+
+md_outliers_all <- md_tbl_all %>% dplyr::filter(is_outlier)
+md_multi_all    <- md_outliers_all %>% dplyr::count(ID, sort = TRUE) %>% dplyr::filter(n > 1)
+
+md_tbl_all
+md_outliers_all
+md_multi_all
+
+# 3) Remove outlier ID
+df_corr_input_all_nooutlier <- df_corr_input_all %>%
+  dplyr::filter(ID != "sub-434971") %>%
+  droplevels() %>%
+  ungroup()
+
+# 4) Fisher-z CI for Pearson r (95% hard-coded)
+pearson_ci <- function(r, n) {
+  z <- atanh(r)
+  se <- 1 / sqrt(n - 3)
+  zcrit <- stats::qnorm(1 - (1 - 0.95) / 2)
+  c(low = tanh(z - zcrit * se), high = tanh(z + zcrit * se))
+}
+
+# 5) SIMPLE correlations only (Pearson) per ROI + Bonferroni
+H3_corr_lure_simple <- df_corr_input_all_nooutlier %>%
+  dplyr::group_by(roi_group) %>%
+  dplyr::group_modify(~{
+    d <- .x %>% dplyr::select(LureBiasScore, lure_dprime) %>% tidyr::drop_na()
+    ct <- stats::cor.test(d$LureBiasScore, d$lure_dprime, method = "pearson")
+    r  <- unname(ct$estimate)
+    p  <- ct$p.value
+    n  <- nrow(d)
+    ci <- pearson_ci(r, n)
+
+    tibble::tibble(
+      n = n,
+      r = r,
+      p = p,
+      ci = sprintf("[%.3f, %.3f]", ci["low"], ci["high"])
+    )
+  }) %>%
+  ungroup() %>%
+  mutate(
+    p_adj = p.adjust(p, method = "bonferroni")
+  ) %>%
+  arrange(p_adj)
+
+H3_corr_lure_simple
+
+
+```
+
+### Compare correlations
+
+```{r}
+# --- A) Build subject-level wide table (bias per ROI, plus lure_dprime per ID)
+wide_bias <- df_corr_input_all_nooutlier %>%
+  group_by(ID, roi_group) %>%
+  summarise(
+    bias = mean(LureBiasScore, na.rm = TRUE),
+    lure_dprime = first(lure_dprime),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(
+    names_from  = roi_group,
+    values_from = bias,
+    names_repair = "minimal"
+  )
+
+roi_cols <- setdiff(names(wide_bias), c("ID", "lure_dprime"))
+
+# --- B) Pairwise dependent-correlation tests:
+# compares r(lure_dprime, ROI1_bias) vs r(lure_dprime, ROI2_bias)
+H3_pairwise_roi_corrdiff <- combn(roi_cols, 2, simplify = FALSE) %>%
+  purrr::map_dfr(function(pair){
+    roi1 <- pair[1]
+    roi2 <- pair[2]
+
+    d <- wide_bias %>%
+      select(lure_dprime, all_of(roi1), all_of(roi2)) %>%
+      drop_na()
+
+    n <- nrow(d)
+
+    r1  <- cor(d$lure_dprime, d[[roi1]], method = "pearson")
+    r2  <- cor(d$lure_dprime, d[[roi2]], method = "pearson")
+    r12 <- cor(d[[roi1]], d[[roi2]], method = "pearson")
+
+    # Williams/Steiger-style test for two dependent correlations sharing one variable
+    tst <- psych::r.test(n = n, r12 = r1, r13 = r2, r23 = r12)
+
+    tibble(
+      roi1 = roi1,
+      roi2 = roi2,
+      n = n,
+      r_roi1 = r1,
+      r_roi2 = r2,
+      r_roi1_roi2 = r12,
+      t = unname(tst$t),
+      p = unname(tst$p)
+    )
+  }) %>%
+  mutate(p_adj_bonf = p.adjust(p, method = "bonferroni")) %>%
+  arrange(p_adj_bonf, p)
+
+H3_pairwise_roi_corrdiff
+```
+
+
+## Analysis 5 - REC MD
+
+### ANOVA #1 - LureMD
+
+```{r}
+### FILTERING FR AT LEAST 5 items per condition per run
+run_status <- semmst_behav_data_rec_filtered %>% 
+  select(ID, run, trial_type, correctness) %>% 
+  filter(trial_type %in% c("CLOSE", "DISTANT")) %>%
+  mutate(run = as.integer(str_extract(as.character(run), "\\d+"))) %>%
+  count(ID, run, correctness, name = "n") %>%
+  group_by(ID, run) %>%
+  complete(correctness, fill = list(n = 0)) %>%
+  summarise(
+    min_n = min(n),                 
+    run_ok = (min_n >= 5),
+    .groups = "drop"
+  ) %>%
+  select(ID, run, run_ok) %>% 
+  tidyr::pivot_wider(
+    names_from  = run,
+    values_from = run_ok,
+    names_prefix = "run",
+    values_fill = FALSE
+  ) %>%
+  mutate(
+    group = case_when(
+      run1 & run2 ~ "both_ok",
+      !run1 & run2 ~ "run1_low_only",
+      run1 & !run2 ~ "run2_low_only",
+      TRUE ~ "both_low"
+    )
+  )
+
+# We use both runs only if both have n > 5 items in all bins, otherwise only 1 run or exclude
+ids_both_ok      <- run_status %>% filter(group == "both_ok")      %>% pull(ID)
+ids_run1_lowonly <- run_status %>% filter(group == "run1_low_only") %>% pull(ID)
+ids_run2_lowonly <- run_status %>% filter(group == "run2_low_only") %>% pull(ID)
+
+semmst_merged_data_filtered_lures = semmst_merged_data_filtered
+
+df_LureCR_all <- semmst_merged_data_filtered_lures %>%
+  filter(task == "RecognitionRespAll", cope_name == "LureCR")
+
+df_LureFA_both_ok <- semmst_merged_data_filtered_lures %>%
+  filter(task == "RecognitionRespAll", cope_name == "LureFA") %>%
+  semi_join(tibble(ID = ids_both_ok), by = "ID")
+
+df_LureFA_use_run2 <- semmst_merged_data_filtered_lures %>%
+  filter(task == "RecognitionRespAllRun2", cope_name == "LureFA") %>%
+  semi_join(tibble(ID = ids_run1_lowonly), by = "ID")
+
+df_LureFA_use_run1 <- semmst_merged_data_filtered_lures %>%
+  filter(task == "RecognitionRespAllRun1", cope_name == "LureFA") %>%
+  semi_join(tibble(ID = ids_run2_lowonly), by = "ID")
+
+# Merge for testing
+df_LureFA_all <- bind_rows(
+  df_LureFA_both_ok,
+  df_LureFA_use_run2,
+  df_LureFA_use_run1
+)
+
+semmst_merged_data_H4_lureFACR <- bind_rows(df_LureCR_all, df_LureFA_all)
+
+keep_ids <- semmst_merged_data_H4_lureFACR %>%
+  group_by(ID, roi_cluster) %>%
+  summarise(
+    has_LureCR = any(cope_name == "LureCR"),
+    has_LureFA = any(cope_name == "LureFA"),
+    .groups = "drop"
+  ) %>%
+  filter(has_LureCR & has_LureFA) %>% count(ID) %>% 
+  filter(n > 1) %>% 
+  pull(ID)
+
+semmst_merged_data_H4_lureFACR <- semmst_merged_data_H4_lureFACR %>%
+  filter(ID %in% keep_ids) %>% 
+  droplevels()
+
+  
+# ASSUMPTION CHECKS
+## OUTLIER
+semmst_merged_data_H4_lureFACR %>%
+  group_by(cope_name, roi_cluster, task) %>%
+  identify_outliers(estimate) %>% 
+  dplyr::select(ID, roi_cluster, cope_name, is.outlier, is.extreme) %>% 
+  filter(is.extreme==TRUE)
+
+semmst_merged_data_H4_lureFACR_nooutlier = semmst_merged_data_H4_lureFACR %>%
+  #filter(ID != "sub-632012") %>% 
+  ungroup()
+
+semmst_merged_H4_AOV = semmst_merged_data_H4_lureFACR_nooutlier %>% 
+  droplevels() %>%
+  anova_test(dv = estimate, wid = ID, within = c(cope_name, roi_cluster))#, covariate = c(NonWord_sum_scale))
+
+get_anova_table(semmst_merged_H4_AOV)
+
+# REPORT                 Effect DFn DFd     F     p p<.05   ges
+## 1               cope_name   1  23 1.621 0.216       0.013
+## 2             roi_cluster   1  23 0.584 0.453       0.005
+## 3   cope_name:roi_cluster   1  23 1.079 0.310       0.006
+
+# POST-HOC
+# pairwise comparisons - stim_type * order
+semmst_merged_H4_REC_lureFACR_PWC = semmst_merged_data_H4_lureFACR_nooutlier %>%
+  group_by(roi_cluster) %>% 
+  pairwise_t_test(
+    estimate ~ cope_name, 
+    paired = TRUE,
+    detailed = TRUE,
+    ) %>% 
+  ungroup() %>% 
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance() %>%
+  ungroup() %>% 
+  mutate(label = paste0("p=", signif(p.adj, 3)))
+semmst_merged_H4_REC_lureFACR_PWC
+
+```
+
+### ANOVA #2 - REC CONDITIONS
+
+```{r}
+
+# Control analysis for CR only on the total sample
+semmst_merged_data_filtered_H4_REC_conditions = semmst_merged_data_filtered %>% 
+  filter(task == "RecognitionRespAll") %>% 
+  filter(cope_name %in% c("LureCR", "FoilCR", "TargetHIT"))
+
+# ASSUMPTION CHECKS
+## OUTLIER
+semmst_merged_data_filtered_H4_REC_conditions %>%
+  group_by(cope_name, roi_cluster) %>%
+  identify_outliers(estimate) %>% 
+  dplyr::select(ID, roi_cluster, cope_name, is.outlier, is.extreme) %>% 
+  filter(is.extreme==TRUE)
+
+semmst_merged_data_filtered_H4_REC_conditions_nooutlier = semmst_merged_data_filtered_H4_REC_conditions %>%
+  ungroup()
+
+semmst_merged_H4_REC_conditions_AOV = semmst_merged_data_filtered_H4_REC_conditions_nooutlier %>% 
+  droplevels() %>%
+  anova_test(dv = estimate, wid = ID, within = c(cope_name, roi_cluster))#, covariate = c(NonWord_sum_scale))
+
+get_anova_table(semmst_merged_H4_REC_conditions_AOV)
+
+#                 Effect DFn DFd     F     p p<.05   ges
+## 1             cope_name   2  58 6.967 0.002     * 0.040
+## 2           roi_cluster   1  29 2.018 0.166       0.015
+## 3 cope_name:roi_cluster   2  58 0.508 0.604       0.002
+
+
+# POST-HOC
+# pairwise comparisons - stim_type * order
+semmst_merged_H4_REC_conditions_PWC = semmst_merged_data_filtered_H4_REC_conditions_nooutlier %>%
+  group_by(task) %>% 
+  pairwise_t_test(
+    estimate ~ cope_name, 
+    paired = TRUE,
+    detailed = TRUE,
+    ) %>% 
+  ungroup() %>% 
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance() %>%
+  ungroup() %>% 
+  mutate(label = paste0("p=", signif(p.adj, 3)))
+semmst_merged_H4_REC_conditions_PWC
+
+##   roi_cluster               estimate .y.      group1 group2      n1    n2 statistic     p    df conf.low conf.high method alternative p.adj 
+##   1 L_HEAD_DGCA23_HEAD_SUB_14   0.138  estimate FoilCR LureCR      30    30      3.43 0.002    29  0.0558     0.221  T-test two.sided   0.012 *  
+##   4 R_HEAD_DGCA23_HEAD_SUB_15   0.103  estimate FoilCR LureCR      30    30      3.05 0.005    29  0.0341     0.173  T-test two.sided   0.03  * 
+
+# AGAINTS ZERO BASLEINE
+
+semmst_merged_H4_REC_FoilLure_vs0 <- semmst_merged_data_filtered_H4_REC_conditions_nooutlier %>%
+  filter(cope_name %in% c("FoilCR", "LureCR")) %>%
+  group_by(cope_name) %>%
+  t_test(
+    estimate ~ 1,
+    mu = 0,
+    detailed = TRUE
+  ) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance("p.adj") %>%
+  mutate(label = paste0("p=", signif(p.adj, 3))) %>%
+  ungroup()
+
+semmst_merged_H4_REC_FoilLure_vs0
+
+### cope_name estimate .y.      group1 group2         n statistic       p    df conf.low conf.high method alternative  p.adj p.adj.signif label   
+## 1 FoilCR      0.0298 estimate 1      null model    60     0.976 0.333      59  -0.0313    0.0909 T-test two.sided   0.666  ns           p=0.666 
+## 2 LureCR     -0.0911 estimate 1      null model    60    -2.77  0.00758    59  -0.157    -0.0252 T-test two.sided   0.0152 *            p=0.0152
+
+```
+
+
+# Figures
+## Figure 1 - Behavioral figures (response, LDI)
+
+### Figure 1A - response ratio
+
+```{r}
+knitr::opts_chunk$set(
+  fig.width  = 11,            # same as ggsave width
+  fig.height = 16,            # same as ggsave height
+  dpi        = 300,
+  fig.retina = 2,             # crisp in HTML
+  out.width  = "45%",         # display smaller, but proportions/text scale together
+  dev        = "ragg_png"
+)
+
+dodge <- 0.7
+trial_order <- c("TARGET", "CLOSE", "DISTANT", "FOIL")
+
+# 1) Build per-ID percentages so the two responses sum to 100% within each ID × trial_type
+figA_base <- semmst_behav_data_rec_filtered %>%
+  filter(!is.na(ID), !is.na(trial_type), !is.na(response)) %>%
+  mutate(
+    trial_type = factor(trial_type, levels = trial_order),
+    response   = factor(response)
+  )
+
+resp_lvls <- levels(figA_base$response)
+
+figA_pct <- figA_base %>%
+  dplyr::count(ID, trial_type, response, name = "n") %>%
+  tidyr::complete(response = factor(resp_lvls, levels = resp_lvls), fill = list(n = 0)) %>%
+  dplyr::mutate(
+    percent_response = 100 * n / sum(n),
+    .by = c(ID, trial_type)
+  )
+
+# 2) Within-subject SE across ID for each (trial_type × response)
+figA_barsum <- Rmisc::summarySEwithin(
+  data       = figA_pct,
+  measurevar = "percent_response",
+  withinvars = c("trial_type", "response"),
+  idvar      = "ID",
+  na.rm      = TRUE
+)
+
+
+# Paul Tol "Light" (pastel, print-friendly): light blue / light orange
+fill_vals <- setNames(c("#EE8866", "#77AADD"), levels(figA_barsum$response))
+
+behav_fig_A <- ggplot(figA_barsum, aes(
+    x = trial_type, y = percent_response,
+    fill = response, group = response
+  )) +
+  geom_col(position = position_dodge(width = dodge), width = 0.70) +
+  geom_errorbar(
+    aes(ymin = percent_response - se, ymax = percent_response + se),
+    position = position_dodge(width = dodge), width = 0.2, size = 1.4
+  ) +
+  scale_fill_manual(values = fill_vals) +
+  scale_y_continuous(limits = c(0, 100), expand = expansion(mult = c(0.01, 0.06))) +
+  scale_x_discrete(
+    drop = FALSE,
+    labels = c(
+      "TARGET"  = "TARGET",
+      "CLOSE"   = "CLOSE\nLURE",
+      "DISTANT" = "DISTANT\nLURE",
+      "FOIL"    = "FOIL"
+    )
+  ) +
+  labs(
+    x = "Trial type",
+    y = "Response percentages",
+    fill = "Response"
+  ) +
+  theme_classic(base_size = 16) +
+  theme(
+    legend.position = c(0.15, 0.95),
+  )
+
+behav_fig_A
+
+```
+
+```{r}
+text_base_export=40
+behav_fig_A_export <- behav_fig_A +
+  theme_classic(base_size = text_base_export) +
+  theme(
+    legend.position = c(0.18, 0.95),
+    legend.title = element_text(size = text_base_export * 0.95),
+    legend.text  = element_text(size = text_base_export * 0.90),
+    axis.text.x  = element_text(size = text_base_export * 0.90, margin = margin(t = 2)),
+    axis.text.y  = element_text(size = text_base_export * 0.90),
+    axis.title   = element_text(size = text_base_export * 1.05)
+  )
+
+ggsave(
+  "derivatives/figures/Figure1A.png",
+  plot   = behav_fig_A_export,
+  width  = 18, height = 13, units = "in",
+  dpi    = 300, bg = "white", device = "png"
+)
+
+```
+
+
+### Figure 1 D - D-primes
+
+```{r}
+# 1) Prep & adjustment (remove linear effects of covariates)
+figD_plot_base <- semmst_behav_data_rec_LDI_ANCOVA %>%
+  filter(!is.na(ID), !is.na(dprime_type), !is.na(dprime_value)) %>%
+  mutate(
+    dprime_type = factor(dprime_type),
+    sex = factor(sex)
+  )
+
+# order as: Close, Distant, Target
+figD_contrast_order <- c("close_dprime", "distant_dprime", "rec_dprime")
+figD_plot_base <- figD_plot_base %>%
+  mutate(dprime_type = fct_relevel(dprime_type, figD_contrast_order))
+
+# covariate-only model for adjustment
+figD_mod_cov <- lm(dprime_value ~ sex + age + Vocabulary_scale + Digit_Symbol_scale + NonWord_sum_scale,
+              data = figD_plot_base)
+
+figD_plot_base <- figD_plot_base %>%
+  mutate(dprime_adj = dprime_value - predict(figD_mod_cov, newdata = figD_plot_base) + mean(dprime_value, na.rm = TRUE))
+
+# 2) Labels & colors
+figD_x_lab_map <- c(
+  "close_dprime"   = "CLOSE\nLURE",
+  "distant_dprime" = "DISTANT\nLURE",
+  "rec_dprime"  = "FOIL"
+)
+
+# Paul Tol (muted): blue / yellow / red — CVD-safe, good in print & grayscale
+figD_fill_vals <- c("close_dprime"="#4477AA", "distant_dprime"="#DDCC77", "rec_dprime"="#117733")
+
+# 3) Plot
+behav_fig_D <- ggplot(figD_plot_base, aes(x = dprime_type, y = dprime_adj, fill = dprime_type)) +
+  geom_boxplot(width = 0.6, outlier.alpha = 0.4, linewidth = 1.8, color = "black") +
+  stat_summary(fun = mean, geom = "point", shape = 21,  size = 2.2, fill = "white", color = "black") +
+  scale_x_discrete(labels = figD_x_lab_map, drop = FALSE) +
+  scale_fill_manual(values = figD_fill_vals, guide = "none") +
+  labs(
+    x = "Discriminability contrasts",
+    y = "Covariate-adjusted d'\n [p(\"old\"|target) - p(\"old\"|condition)]"
+  ) +
+  theme_classic(base_size = 14)
+
+behav_fig_D
+
+```
+
+```{r}
+behav_fig_D_export <- behav_fig_D +
+  theme_classic(base_size = 40) +
+  theme(
+    axis.title = element_text(size = 42),
+    axis.text  = element_text(size = 34)
+  ) + labs(x = NULL)
+
+ggsave(
+  "derivatives/figures/Figure1D.png",
+  plot   = behav_fig_D_export,
+  width  = 9, height = 16, units = "in",
+  dpi    = 300,
+  bg     = "white",
+  device = "png"   # base png
+)
+```
+
+
+### Figure 1 E - continous GLMEM
+
+```{r}
+# In this plot, we predict p|old by cosine similarity
+# Base data: binary outcome + keep CLOSE & DISTANT only
+semmst_behav_data_rec_filtered_GLMEM_plot <- semmst_behav_data_rec_filtered_GLMEM %>%
+  mutate(response = as.integer(response == "old")) %>%
+  filter(trial_type %in% c("CLOSE", "DISTANT"))
+# If your column is 'trial_type', replace 'trial_type' with 'trial_type' above.
+
+# Build a facetting variable: Overall, DISTANT-only, CLOSE-only
+semmst_behav_data_rec_filtered_GLMEM_plot_facet <- bind_rows(
+  semmst_behav_data_rec_filtered_GLMEM_plot %>% mutate(panel = "ALL LURE"),
+  semmst_behav_data_rec_filtered_GLMEM_plot %>% filter(trial_type == "DISTANT") %>% mutate(panel = "DISTANT LURE"),
+  semmst_behav_data_rec_filtered_GLMEM_plot %>% filter(trial_type == "CLOSE")   %>% mutate(panel = "CLOSE LURE")
+) %>%
+  mutate(panel = factor(panel, levels = c("ALL LURE", "DISTANT LURE", "CLOSE LURE")))
+
+# Okabe–Ito (CVD-safe): purple, yellow, blue
+figE_cols <- c("ALL LURE" = "#CC79A7", "DISTANT LURE" = "#DDCC77", "CLOSE LURE" = "#4477AA")
+
+behav_fig_E <- ggplot(semmst_behav_data_rec_filtered_GLMEM_plot_facet,
+       aes(x = cosine, y = response, color = panel, fill = panel)) +
+  geom_smooth(
+    method = "glm", method.args = list(family = "binomial"),
+    linewidth = 2, se = TRUE, alpha = 0.25
+  ) +
+  facet_wrap(~ panel, nrow = 1, scales = "free_x") +
+  scale_x_continuous(
+    breaks = function(lims) round(lims[1] + c(0.1, 0.5, 0.9) * (lims[2] - lims[1]), 2),
+    labels = function(x) sprintf("%.2f", x)
+  ) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_color_manual(values = figE_cols, guide = "none") +
+  scale_fill_manual(values = figE_cols, guide = "none") +
+  labs(x = "Cosine similarity", y = "Percentage of 'old' responses") +
+  theme_classic(base_size = 14) +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+
+behav_fig_E
+
+```
+
+```{r}
+
+behav_fig_E_export <- behav_fig_E +
+  theme_classic(base_size = 40) +
+  theme(
+    axis.title = element_text(size = 42),
+    axis.text  = element_text(size = 32)
+  )
+
+ggsave(
+  "derivatives/figures/Figure1E.png",
+  plot   = behav_fig_E_export,
+  width  = 16, height = 16, units = "in",
+  dpi    = 300,
+  bg     = "white",
+  device = "png"   # base png
+)
+
+```
+
+### Figure 1 C - Lure cosine similarities
+
+```{r}
+
+figC_plot_base <- semmst_behav_data_rec_filtered %>%
+  filter(trial_type %in% c("CLOSE", "DISTANT")) %>%
+  mutate(trial_type = factor(trial_type,
+                             levels = c("CLOSE", "DISTANT"),
+                             labels = c("CLOSE LURE", "DISTANT LURE"))) %>%
+  dplyr::select(trial_type, noun, cosine) %>% 
+  unique()
+
+# Paul Tol (muted): blue / yellow / red — CVD-safe, good in print & grayscale
+figC_fill_vals <- c("CLOSE LURE"="#4477AA", "DISTANT LURE"="#DDCC77")
+
+# 3) Plot
+behav_fig_C_hists <- ggplot(figC_plot_base, aes(x = cosine, fill = trial_type)) +
+  geom_histogram(
+    bins = 20,              # tweak bins/binwidth as you like
+    color = "black",
+    linewidth = 1.0
+  ) +
+  facet_wrap(~ trial_type, ncol = 1) +   # <-- vertically stacked (2 panels if 2 trial types)
+  scale_fill_manual(values = figC_fill_vals, guide = "none") +
+  labs(
+    x = "Cosine similarity [1.0 = identical]",
+    y = "Number of items in 20 equally spaced bins"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    panel.spacing = unit(0.7, "lines")
+  )
+
+behav_fig_C_hists
+
+```
+
+
+```{r}
+behav_fig_C_export <- behav_fig_C_hists +
+  theme_classic(base_size = 40) +
+  theme(
+    axis.title = element_text(size = 38),
+    axis.text  = element_text(size = 34)
+  ) 
+
+ggsave(
+  "derivatives/figures/Figure1C.png",
+  plot   = behav_fig_C_export,
+  width  = 12, height = 19, units = "in",
+  dpi    = 300,
+  bg     = "white",
+  device = "png"   # base png
+)
+```
+
+
+## Figure 2 - ENC RS specificity
+
+```{r}
+
+# BARPLOT
+fig2_dodge <- 0.8
+
+fig2_barsum <- Rmisc::summarySEwithin(
+  data        = semmst_merged_data_H1_nooutlier,
+  measurevar  = "estimate",
+  withinvars  = c("stim_type","order", "roi_cluster"),
+  idvar       = "ID",
+  na.rm       = TRUE
+) %>%
+  mutate(stim_type = factor(as.character(stim_type),
+                            levels = c("Exact","Lure"),
+                            labels = c("Exact","Modified")))
+
+fig2_roi_lab <- semmst_merged_data_H1_nooutlier %>%
+  dplyr::distinct(roi_cluster, hemisphere, roi, cluster, voxels) %>%
+  dplyr::mutate(
+    roi_label = dplyr::case_when(
+      roi == "HEAD_DGCA23_HEAD_SUB" & hemisphere == "R" ~ "Right DG-CA2/3-SUB cluster",
+      roi == "HEAD_DGCA23_HEAD_SUB" & hemisphere == "L" ~ "Left DG-CA2/3-SUB cluster"
+    )
+  ) %>%
+  dplyr::select(roi_cluster, roi_label)
+
+# ------------------------------------------------------------
+# NEW: paired tests of stim_type (Exact vs Modified) WITHIN each order,
+# collapsed across roi_cluster (same p-values in both facets)
+# ------------------------------------------------------------
+fig2_stat.test <- semmst_merged_data_H1_nooutlier %>%
+  mutate(stim_type = factor(as.character(stim_type),
+                            levels = c("Exact","Lure"),
+                            labels = c("Exact","Modified"))) %>%
+  group_by(ID, order, stim_type) %>%
+  summarise(estimate = mean(estimate, na.rm = TRUE), .groups = "drop") %>%
+  group_by(order) %>%
+  rstatix::t_test(estimate ~ stim_type, paired = TRUE) %>%
+  ungroup() %>%
+  rstatix::adjust_pvalue(method = "bonferroni") %>%
+  rstatix::add_significance("p.adj") %>%
+  mutate(
+    label = dplyr::case_when(
+      p.adj < 0.001 ~ "p < .001",
+      p.adj < .01   ~ "p < .01",
+      TRUE          ~ paste0("p = ", sub("^0", "", sprintf("%.2f", p.adj)))
+    )
+  )
+
+# 1) Attach ROI labels to barsum
+fig2_barsum <- fig2_barsum %>% dplyr::left_join(fig2_roi_lab, by = "roi_cluster")
+
+# 2) replicate the same stats into both facets and set y.position per facet+order
+fig2_stat.test <- fig2_stat.test %>%
+  tidyr::crossing(fig2_barsum %>% dplyr::distinct(roi_label)) %>%
+  dplyr::left_join(
+    fig2_barsum %>%
+      dplyr::group_by(order, roi_label) %>%
+      dplyr::summarise(y.position = max(estimate + se, na.rm = TRUE) * 1.08, .groups = "drop"),
+    by = c("order", "roi_label")
+  )
+
+# 3) compute xmin/xmax to connect Exact ↔ Modified within each ORDER (dodge offset)
+fig2_stim_lvls <- levels(factor(fig2_barsum$stim_type))  # should be c("Exact","Modified")
+exact_idx <- which(fig2_stim_lvls == "Exact")
+mod_idx   <- which(fig2_stim_lvls == "Modified")
+
+fig2_stat.test <- fig2_stat.test %>%
+  mutate(
+    order = factor(order, levels = c("First", "Repeat")),
+    offset = if_else(order == "First", -fig2_dodge/2, +fig2_dodge/2),
+    xmin = exact_idx + offset,
+    xmax = mod_idx   + offset
+  )
+
+# --- bar plot (fill by stim_type color, opacity by order), same dodging ---
+fig2_plot <- ggplot(fig2_barsum, aes(
+    x = stim_type, y = estimate,
+    fill = stim_type,           # color by stim type
+    group = `order`             # ensures side-by-side bars per stim_type
+  )) +
+  geom_col(aes(alpha = order), position = position_dodge(width = fig2_dodge), width = 0.65) +
+  geom_errorbar(
+    aes(ymin = estimate - se, ymax = estimate + se),
+    position = position_dodge(width = fig2_dodge), width = 0.15, size=1.2
+  ) +
+  facet_wrap(~ roi_label) +
+  theme_classic(base_size = 13) +
+  labs(x = "Condition during encoding", y = "Mean % signal change", fill = "Stimulus", alpha = "Order") +
+  # accessible, pleasant green & violet
+  scale_fill_manual(values = c(
+    "Exact" = "#66BB6A",       # soft green
+    "Modified"  = "#9575CD"    # soft violet
+  )) +
+  # subtle opacity difference for First vs Repeat
+  scale_alpha_manual(values = c(
+    "First"  = 0.95,
+    "Repeat" = 0.55
+  )) +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.14))) +
+  custom_theme + guides(fill = "none") +
+  theme(
+    legend.position = c(0.88, 0.93)  # a bit up
+  )
+
+# --- add bracket + p (Exact vs Modified within each order; same in both facets) ---
+fig2_plot  +
+  ggpubr::stat_pvalue_manual(
+    fig2_stat.test,
+    label = "label",
+    xmin = "xmin",
+    xmax = "xmax",
+    y.position = "y.position",
+    tip.length = 0.01,
+    hide.ns = TRUE,
+    inherit.aes = FALSE,
+    bracket.shorten=1.2,
+    size = 5.4,
+    bracket.size = 1.0
+  )
+
+```
+
+```{r}
+
+text_base_export=40
+p_text_size_mm <- text_base_export * 0.20   # ~points → mm-ish (tweak 0.30–0.45)
+p_bracket_mm   <- p_text_size_mm * 0.15     # bracket thickness relative to text
+
+fig2_plot_export <- fig2_plot +
+  theme_classic(base_size = text_base_export) +
+  theme(
+    legend.position = c(0.88, 0.88),
+    legend.title = element_text(size = text_base_export * 0.88),
+    legend.text  = element_text(size = text_base_export * 0.90),
+    axis.text.x  = element_text(size = text_base_export * 0.90, margin = margin(t = 2)),
+    axis.text.y  = element_text(size = text_base_export * 0.90),
+    axis.title   = element_text(size = text_base_export * 1.05),
+    strip.text = element_blank(),
+    panel.spacing.x = unit(4, "in")
+  )
+
+ggsave(
+  "derivatives/figures/Figure2B.png",
+  plot   = fig2_plot_export,
+  width  = 26, height = 13, units = "in",
+  dpi    = 300, bg = "white", device = "png"
+)
+
+```
+
+
+## Figure 3 - Power curves
+
+#### Table 1
+
+```{r}
+
+# read MATLAB output(model specs)
+fit_long <- read_csv("derivatives/matlab_fit_table_long.csv", show_col_types = FALSE)
+
+# Clean ROI label (same spirit as your facet labels)
+make_roi_label <- function(roi_string) {
+  parts <- str_split(roi_string, "_", simplify = FALSE)[[1]]
+  hemi  <- if (length(parts) >= 1 && parts[1] == "L") "Left " else "Right "
+
+  core <- parts
+  if (length(core) >= 2) core <- core[-1]
+  if (length(core) >= 1) core <- core[-length(core)]
+  core <- core[core != "HEAD"]
+  core <- core[core != ""]
+  core <- str_replace_all(core, "CA23", "CA2/3")
+
+  paste0(hemi, paste(core, collapse = "-"))
+}
+
+# Excel-friendly model string (keep f(x), keep x; we italicize via Excel style)
+to_excel_model <- function(s) {
+  s %>%
+    str_replace_all("\\+\\s*-", " - ") %>%
+    str_replace("f\\(x\\)=", "f(x) = ") %>%
+    str_replace_all("\\*", "×") %>%
+    str_squish()
+}
+
+# Build single long table (with ROI only on first row per ROI)
+table1_df <- fit_long %>%
+  mutate(
+    FitType2  = recode(FitType, Power2 = "Power", Linear = "Linear"),
+    Winner2   = recode(Winner,  Power2 = "Power", Linear = "Linear"),
+    is_winner = (FitType2 == Winner2),
+    FitType2  = factor(FitType2, levels = c("Power", "Linear")),
+    ROI_lab   = map_chr(ROI, make_roi_label)
+  ) %>%
+  arrange(ROI, FitType2) %>%
+  group_by(ROI) %>%
+  mutate(ROI_print = if_else(row_number() == 1, first(ROI_lab), "")) %>%
+  ungroup() %>%
+  transmute(
+    ROI          = ROI_print,
+    `Fit type`   = as.character(FitType2),
+    Model        = to_excel_model(Model),
+    `Adj. R²`    = sprintf("%.3f", AdjR2),
+    `R²`         = sprintf("%.3f", R2),
+    RMSE         = sprintf("%.3f", RMSE),
+    SSE          = sprintf("%.3f", SSE),
+    DFE          = as.integer(DFE),
+    is_winner
+  )
+
+winner_rows <- which(table1_df$is_winner) + 1  # +1 for header row
+table1_out  <- table1_df %>% select(-is_winner)
+
+# Write APA Excel
+out_file <- "derivatives/figures/Table1.xlsx"
+dir.create(dirname(out_file), recursive = TRUE, showWarnings = FALSE)
+
+wb <- createWorkbook()
+addWorksheet(wb, "Table1")
+showGridLines(wb, "Table1", showGridLines = FALSE)
+
+writeData(wb, "Table1", table1_out, startRow = 1, startCol = 1, colNames = TRUE)
+
+n_data <- nrow(table1_out)
+n_col  <- ncol(table1_out)
+last_row <- 1 + n_data
+
+#styles
+base_style <- createStyle(
+  fontName = "Times New Roman", fontSize = 12,
+  halign = "left", valign = "center", wrapText = TRUE
+)
+
+header_style <- createStyle(
+  fontName = "Times New Roman", fontSize = 12,
+  textDecoration = "bold",
+  halign = "left", valign = "center",
+  border = c("top", "bottom"),
+  borderStyle = c("thick", "medium"),
+  borderColour = c("black", "black")
+)
+
+bottom_rule_style <- createStyle(
+  border = "bottom", borderStyle = "thick", borderColour = "black"
+)
+
+winner_style <- createStyle(textDecoration = "bold")
+model_italic <- createStyle(textDecoration = "italic")
+
+foot_style <- createStyle(
+  fontName = "Times New Roman", fontSize = 11,
+  halign = "left", valign = "top", wrapText = TRUE
+)
+
+# ---- apply base style
+addStyle(wb, "Table1", base_style,
+         rows = 1:last_row, cols = 1:n_col,
+         gridExpand = TRUE, stack = TRUE)
+
+# ---- header rules
+addStyle(wb, "Table1", header_style,
+         rows = 1, cols = 1:n_col,
+         gridExpand = TRUE, stack = TRUE)
+
+# ---- bottom rule
+addStyle(wb, "Table1", bottom_rule_style,
+         rows = last_row, cols = 1:n_col,
+         gridExpand = TRUE, stack = TRUE)
+
+# ---- bold winner rows
+if (length(winner_rows) > 0) {
+  addStyle(wb, "Table1", winner_style,
+           rows = winner_rows, cols = 1:n_col,
+           gridExpand = TRUE, stack = TRUE)
+}
+
+# ---- italicize MODEL column (keeps f(x) and x italic)
+model_col <- which(names(table1_out) == "Model")
+addStyle(wb, "Table1", model_italic,
+         rows = 2:last_row, cols = model_col,
+         gridExpand = TRUE, stack = TRUE)
+
+# ---- widths + row heights
+setColWidths(wb, "Table1", cols = 1, widths = 22)                 # ROI
+setColWidths(wb, "Table1", cols = 2, widths = 10)                 # Fit type
+setColWidths(wb, "Table1", cols = 3, widths = 55)                 # Model
+setColWidths(wb, "Table1", cols = 4:7, widths = 12)               # numeric cols
+setColWidths(wb, "Table1", cols = 8, widths = 8)                  # DFE
+
+setRowHeights(wb, "Table1", rows = 2:last_row, heights = 24)
+
+# ---- footnote (under table)
+foot_txt <- paste0(
+  "Linear, linear fit; Power, power fit; RMSE, root mean squared error; ",
+  "SSE, sum of squares error; DFE, degrees of freedom error"
+)
+
+foot_row <- last_row + 2
+writeData(wb, "Table1", foot_txt, startRow = foot_row, startCol = 1, colNames = FALSE)
+mergeCells(wb, "Table1", cols = 1:n_col, rows = foot_row)
+addStyle(wb, "Table1", foot_style, rows = foot_row, cols = 1, stack = TRUE)
+setRowHeights(wb, "Table1", rows = foot_row, heights = 35)
+
+saveWorkbook(wb, out_file, overwrite = TRUE)
+out_file
+
+```
+
+### Figure 3
+
+From "scripts/smst_mr1_pwoerfunction.m" output
+
+```{r}
+# read ROI means
+roi_means <- read_csv("derivatives/matlab_roi_means.csv", show_col_types = FALSE)
+
+roi_order <- unique(roi_means$ROI)
+
+roi_means <- roi_means %>%
+  mutate(ROI = factor(ROI, levels = roi_order))
+
+#read curves + winner styling + ROI factor IN ONE PIPE
+curves <- read_csv("derivatives/matlab_curve_predictions.csv", show_col_types = FALSE) %>%
+  mutate(
+    is_winner = is_winner == 1,
+    linetype  = if_else(is_winner, "solid", "dashed"),
+    line_col  = if_else(is_winner, "winner", "other"),
+    ROI       = factor(ROI, levels = roi_order)
+  )
+
+# read fit table
+fit_long <- read_csv("derivatives/matlab_fit_table_long.csv", show_col_types = FALSE)
+
+# facet labels (Fig4-style)
+make_roi_label <- function(roi_string) {
+  parts <- str_split(roi_string, "_", simplify = TRUE)
+  hemi_lab <- if_else(parts[1] == "L", "Left", "Right")
+
+  core <- parts[1, -1]
+  core <- core[-length(core)]
+  core <- core[core != "HEAD"]
+
+  roi_clean <- paste(core, collapse = "-") %>%
+    gsub("HEAD_", "", .) %>%
+    gsub("_", "-", .) %>%
+    gsub("DG", "DG-", .) %>%
+    gsub("2", "2/", .)
+
+  paste(hemi_lab, roi_clean)
+}
+
+roi_labeller <- setNames(map_chr(roi_order, make_roi_label), roi_order)
+
+# superscript formatting for ^
+to_html_sup <- function(s) {
+  s %>%
+    str_replace_all("\\^\\s*\\(([^)]+)\\)", "<sup>\\1</sup>") %>%
+    str_replace_all("\\^\\s*([A-Za-z0-9\\.]+)", "<sup>\\1</sup>")
+}
+
+# annotation per facet: formula + Adj. R² (Power2 row)
+figure3_labs <- fit_long %>%
+  filter(FitType == "Power2") %>%
+  distinct(ROI, .keep_all = TRUE) %>%
+  mutate(
+    ROI = factor(ROI, levels = roi_order),
+    ann = paste0(
+      "<i>", to_html_sup(Model), "</i>",
+      "<br>Adj. R<sup>2</sup> = ", sprintf("%.3f", AdjR2)
+    )
+  )
+
+# BASE FIGURE 
+fig3 <- ggplot() +
+  scale_color_manual(values = c(winner = "red", other = "grey35"), guide = "none") +
+  scale_linetype_identity() +
+  scale_x_continuous(breaks = 1:3, labels = c("Exact", "Close", "Distant")) +
+  facet_wrap(
+    ~ ROI,
+    scales = "free_y",
+    ncol = 2,
+    labeller = labeller(ROI = as_labeller(roi_labeller))
+  ) +
+  coord_cartesian(clip = "off") +
+  labs(
+    x = "Conditions of repeats during encoding",
+    y = "Mean % signal change<br>(corrected for first presentation baseline)"
+  ) +
+  theme_classic(base_size = 18) +
+  custom_theme +
+  theme(
+    axis.title.y     = ggtext::element_markdown(hjust = 0.5)
+  )
+
+# VIEWABLE FIGURE
+fig3 +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  geom_point(
+    data = roi_means,
+    aes(x = x, y = mean_delta),
+    size = 2.6
+  ) +
+  geom_errorbar(
+    data = roi_means,
+    aes(x = x, ymin = mean_delta - sem_delta, ymax = mean_delta + sem_delta),
+    width = 0.05
+  ) +
+  geom_line(
+    data = curves,
+    aes(
+      x = x, y = y,
+      group = interaction(ROI, model),
+      color = line_col,
+      linetype = linetype
+    ),
+    linewidth = 1.1
+  ) +
+  ggtext::geom_richtext(
+    data = figure3_labs,
+    aes(x = -Inf, y = Inf, label = ann),
+    inherit.aes = FALSE,
+    hjust = -0.05,
+    vjust = 1.7,          
+    size = 4.2,
+    fill = NA, label.color = NA
+  )
+```
+
+
+```{r}
+# EXPORT 
+text_base_export <- 40
+
+fig3_revised <- fig3 +
+  geom_hline(yintercept = 0, linetype = "dotted", linewidth = 1.2) +
+  geom_point(
+    data = roi_means,
+    aes(x = x, y = mean_delta),
+    size = 6.0
+  ) +
+  geom_errorbar(
+    data = roi_means,
+    aes(x = x, ymin = mean_delta - sem_delta, ymax = mean_delta + sem_delta),
+    width = 0.05,
+    linewidth = 1.2
+  ) +
+  geom_line(
+    data = curves,
+    aes(
+      x = x, y = y,
+      group = interaction(ROI, model),
+      color = line_col,
+      linetype = linetype
+    ),
+    linewidth = 3.2
+  ) +
+  ggtext::geom_richtext(
+    data = figure3_labs,
+    aes(x = -Inf, y = Inf, label = ann),
+    inherit.aes = FALSE,
+    hjust = -0.05,
+    vjust = 1.7,       
+    size = 10.5,
+    fill = NA, label.color = NA
+  ) +
+  theme_classic(base_size = text_base_export) +
+  theme(
+    axis.title   = element_text(size = text_base_export * 1.05),
+    axis.text.x  = element_text(size = text_base_export * 0.82, margin = margin(t = 2)),
+    axis.text.y  = element_text(size = text_base_export * 0.90),
+    axis.title.y  = ggtext::element_markdown(hjust = 0.5),
+    strip.background = element_rect(fill = "white", color = "black", linewidth = 1.40),
+    strip.text = element_text(size = text_base_export * 0.86)
+  )
+
+
+ggsave(
+  "derivatives/figures/Figure3.png",
+  plot   = fig3_revised,
+  width  = 22, height = 12.5, units = "in",
+  dpi    = 300, bg = "white", device = "png"
+)
+
+```
+
+
+## Figure 4 - RS ~ LDI
+
+```{r}
+# 1) Long table (ALL trials only)
+figure4_df <- df_corr_input_all_nooutlier %>%
+  dplyr::select(ID, roi_group, roi, hemisphere, bias = LureBiasScore, lure_dprime) %>%
+  tidyr::drop_na(bias, lure_dprime) %>%
+  dplyr::mutate(
+    hemi_lab = dplyr::recode(hemisphere, L = "Left", R = "Right"),
+    roi_clean = roi %>%
+      gsub("HEAD_", "", .) %>%          # strip HEAD_
+      gsub("_", "-", .) %>%
+      gsub("DG", "DG-", .) %>%
+      gsub("2", "2/", .),
+    facet_lab = paste(hemi_lab, roi_clean)
+  )
+
+# 2) Per-ROI correlation + Bonferroni + label text
+figure4_labs <- figure4_df %>%
+  dplyr::group_by(roi_group, facet_lab) %>%
+  dplyr::summarise(
+    n = dplyr::n(),
+    r = unname(stats::cor(bias, lure_dprime, method = "pearson")),
+    p = stats::cor.test(bias, lure_dprime, method = "pearson")$p.value,
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    p_adj = p.adjust(p, method = "bonferroni"),
+    stars = dplyr::case_when(
+      p_adj < .001 ~ "***",
+      p_adj < .01  ~ "**",
+      p_adj < .05  ~ "*",
+      TRUE         ~ ""
+    ),
+    sig = if_else(p_adj < .05, "sig", "ns"),
+    ann = dplyr::case_when(
+      is.na(p_adj) ~ sprintf("r = %.2f, p = NA", r),
+      p_adj < .001 ~ sprintf("r = %.2f, p < .001%s", r, stars),
+      TRUE         ~ sprintf("r = %.2f, p = %.3f%s", r, p_adj, stars)
+    )
+  )
+
+figure4_full <- figure4_df %>%
+  left_join(figure4_labs %>% select(roi_group, sig), by = "roi_group")
+
+# 3) Plot
+fig4 = ggplot(figure4_full, aes(bias, lure_dprime)) +
+  geom_point(alpha = 0.7, size = 4.5) +
+  scale_color_manual(values = c(ns = "grey30", sig = "red"), guide = "none") +
+  facet_wrap(~ roi_group, scales = "free",
+             labeller = labeller(roi_group = setNames(figure4_labs$facet_lab, figure4_labs$roi_group))) +
+  labs(
+    x = "Neural pattern separation\nModified repeat - exact repeat\n(% signal change)",
+    y = "Behavioral mnemonic discrimination\nd' (lures vs targets)"
+  ) +
+  theme_classic(base_size = 18) +
+  custom_theme
+
+fig4 +
+  geom_smooth(aes(color = sig), method = "lm", se = FALSE, linewidth = 1.1) +
+  geom_text(
+    data = figure4_labs,
+    aes(x = -Inf, y = Inf, label = ann, color = sig),
+    inherit.aes = FALSE,
+    hjust = -0.05, vjust = 1.2, size = 5.5
+  )
+
+```
+
+```{r}
+
+text_base_export=40
+fig4_export <- fig4 +
+  geom_smooth(aes(color = sig), method = "lm", se = FALSE, linewidth = 2.6) +
+  geom_text(
+    data = figure4_labs,
+    aes(x = -Inf, y = Inf, label = ann, color = sig),
+    inherit.aes = FALSE,
+    hjust = -0.05, vjust = 1.2, size = 10.5
+  ) +
+  theme_classic(base_size = text_base_export) +
+  theme(
+    legend.title = element_text(size = text_base_export * 0.95),
+    legend.text  = element_text(size = text_base_export * 0.90),
+    axis.text.x  = element_text(size = text_base_export * 0.90, margin = margin(t = 2)),
+    axis.text.y  = element_text(size = text_base_export * 0.90),
+    axis.title   = element_text(size = text_base_export * 1.05)
+  )
+
+ggsave(
+  "derivatives/figures/Figure4.png",
+  plot   = fig4_export,
+  width  = 20, height = 12, units = "in",
+  dpi    = 300, bg = "white", device = "png"
+)
+
+```
+
+## Figure 5 - ENC RS mask -> REC conditions
+
+```{r}
+
+fig5_dodge <- 0.8
+
+level_map <- c("FoilCR", "LureCR", "TargetHIT")
+level_lab <- c("Foil",   "Lure",   "Target")
+
+# 1) Within-subject summary
+fig5_barsum <- Rmisc::summarySEwithin(
+  data        = semmst_merged_data_filtered_H4_REC_conditions_nooutlier,
+  measurevar  = "estimate",
+  withinvars  = c("cope_name", "roi_cluster"),
+  idvar       = "ID",
+  na.rm       = TRUE
+)
+
+fig5_roi_lab <- semmst_merged_data_filtered_H4_REC_conditions_nooutlier %>%
+  distinct(roi_cluster, hemisphere, roi, cluster, voxels) %>%
+  mutate(
+    roi_label = case_when(
+      roi == "HEAD_DGCA23_HEAD_SUB" & hemisphere == "R" ~ "Right DG-CA2/3-SUB",
+      roi == "HEAD_DGCA23_HEAD_SUB" & hemisphere == "L" ~ "Left DG-CA2/3-SUB",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(roi_cluster, roi_label)
+
+fig5_barsum <- fig5_barsum %>%
+  mutate(cope_name = factor(cope_name, levels = level_map, labels = level_lab)) %>%
+  left_join(fig5_roi_lab, by = "roi_cluster")
+
+# 2) Base plot (no stats)
+fig5_plot <- ggplot(fig5_barsum, aes(x = cope_name, y = estimate, fill = cope_name)) +
+  geom_col(position = position_dodge(width = fig5_dodge), width = 0.65) +
+  geom_errorbar(
+    aes(ymin = estimate - se, ymax = estimate + se),
+    position = position_dodge(width = fig5_dodge),
+    width = 0.15,
+    size = 1.2
+  ) +
+  facet_wrap(~ roi_label) +
+  theme_classic(base_size = 13) +
+  labs(x = "Condition during recognition", y = "Mean % signal change") +
+  scale_fill_manual(values = c(
+    "Target" = "#66BB6A",
+    "Lure"   = "#9575CD",
+    "Foil"   = "#EE8866"
+  )) +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.12))) +
+  custom_theme +
+  guides(fill = "none")
+
+# 3) Global paired pairwise stats (collapsed across ROI)
+fig5_stats_global <- semmst_merged_data_filtered_H4_REC_conditions_nooutlier %>%
+  mutate(cope_name = factor(cope_name, levels = level_map, labels = level_lab)) %>%
+  group_by(ID, cope_name) %>%
+  summarise(estimate = mean(estimate, na.rm = TRUE), .groups = "drop") %>%
+  pairwise_t_test(
+    estimate ~ cope_name,
+    paired = TRUE,
+    p.adjust.method = "bonferroni"
+  ) %>%
+  mutate(
+    label = case_when(
+      p.adj < 0.001 ~ "p < .001",
+      p.adj < 0.01  ~ "p < .01",
+      p.adj < 0.05  ~ "p < .05",
+      TRUE ~ paste0("p = ", sub("^0", "", sprintf("%.3f", p.adj)))
+    )
+  )
+
+# Global ymax across BOTH facets (shared bracket height)
+ymax_global <- fig5_barsum %>%
+  summarise(ymax = max(estimate + se, na.rm = TRUE)) %>%
+  pull(ymax)
+
+# Replicate the same stats into each facet; same y.position levels everywhere
+fig5_stats_for_facets <- fig5_barsum %>%
+  distinct(roi_label) %>%
+  tidyr::crossing(fig5_stats_global) %>%
+  group_by(roi_label) %>%
+  arrange(group1, group2, .by_group = TRUE) %>%
+  mutate(
+    y.position = ymax_global * 1.08 + (row_number() - 1) * (0.10 * ymax_global)
+  ) %>%
+  ungroup()
+
+# 4) In-window plot WITH stats
+fig5_plot_with_stats_global <- fig5_plot +
+  stat_pvalue_manual(
+    fig5_stats_for_facets,
+    label = "label",
+    xmin = "group1",
+    xmax = "group2",
+    y.position = "y.position",
+    tip.length = 0.01,
+    hide.ns = TRUE,
+    inherit.aes = FALSE,
+    bracket.size = 1.0,
+    size = 5.0
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.18)))
+
+fig5_plot_with_stats_global
+```
+
+
+```{r}
+text_base_export <- 40
+p_text_export <- text_base_export * 0.28  # bigger p text on export only
+
+fig5_plot_export <- fig5_plot +
+  stat_pvalue_manual(
+    fig5_stats_for_facets,
+    label = "label",
+    xmin = "group1",
+    xmax = "group2",
+    y.position = "y.position",
+    tip.length = 0.01,
+    hide.ns = TRUE,
+    inherit.aes = FALSE,
+    bracket.size = 1.3,
+    size = p_text_export
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.18))) +
+  theme_classic(base_size = text_base_export) +
+  theme(
+    axis.text.x  = element_text(size = text_base_export * 0.90, margin = margin(t = 2)),
+    axis.text.y  = element_text(size = text_base_export * 0.90),
+    axis.title   = element_text(size = text_base_export * 1.05),
+    strip.text   = element_text(size = text_base_export * 0.95)
+  )
+
+ggsave(
+  "derivatives/figures/Figure5.png",
+  plot   = fig5_plot_export,
+  width  = 22, height = 14, units = "in",
+  dpi    = 300, bg = "white", device = "png"
+)
+
+```
+
+
+
+# Supplementary Results
+### Supplementary Results 1 - covariate effects
+
+#### Behavioural GLMEM covariates
+
+```{r}
+
+model_complex_cont = glmer(response ~ cosine * trial_type * former_type +
+                                        age + sex + education + Vocabulary_scale + Digit_Symbol_scale +
+                                                  NonWord_sum_scale + arousal_scale + meaningfulness_scale + concreteness_scale +
+                                        (1|ID) + 
+                                        (1|itemno),
+                                        family = binomial("probit"), 
+                                        data = semmst_behav_data_rec_filtered_GLMEM_lure,
+                                        control = glmerControl(optimizer ='bobyqa', optCtrl=list(maxfun = 20000)), nAGQ=0)
+
+```
+
+
+
+##### Supplementary Figure 2AB.
+
+```{r}
+# 1) Marginal (averaged-over-covariates) predictions
+pred_nonword <- ggeffects::ggaverage(
+  model_complex_cont,
+  terms = "NonWord_sum_scale [n=100]"   # smooth grid
+) %>%
+  as.data.frame() %>%
+  mutate(effect = "Phonological awareness of participants")
+
+pred_meaning <- ggeffects::ggaverage(
+  model_complex_cont,
+  terms = "meaningfulness_scale [n=100]"
+) %>%
+  as.data.frame() %>%
+  mutate(effect = "Meaningfulness of items")
+
+preds_2ABSI <- bind_rows(pred_nonword, pred_meaning)
+
+# 2) Plot (2 facets next to each other)
+fig_ABSI_behav <- ggplot(preds_2ABSI, aes(x = x, y = predicted)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.18, fill="#4C72B0") +
+  geom_line(size = 1.2, colour="#4C72B0") +
+  facet_wrap(~ effect, nrow = 1, scales = "free_x") +
+  theme_classic(base_size = 13) +
+  labs(
+    x = NULL,
+    y = "p(response 'old'|lure)"
+  ) +
+  scale_y_continuous(limits = c(0, 0.5), expand = expansion(mult = c(0.02, 0.06))) +
+  custom_theme
+
+fig_ABSI_behav
+```
+
+
+```{r}
+# 3) Export (matches your Figure2B export approach)
+text_base_export <- 40
+
+fig_ABSI_export <- fig_ABSI_behav +
+  theme_classic(base_size = text_base_export) +
+  theme(
+    axis.text.x  = element_text(size = text_base_export * 0.90, margin = margin(t = 2)),
+    axis.text.y  = element_text(size = text_base_export * 0.90),
+    axis.title   = element_text(size = text_base_export * 1.05)
+  )
+
+ggsave(
+  "derivatives/figures/SI_figures/Figure2ABSI.png",
+  plot   = fig_ABSI_export,
+  width  = 21, height = 11, units = "in",
+  dpi    = 300, bg = "white", device = "png"
+)
+
+
+```
+
+
+#### Encoding ANCOVA MEDIAN SPLIT (Digit-Symbol)
+```{r}
+
+df <- semmst_merged_data_H1_nooutlier %>% 
+  drop_na(Digit_Symbol) %>% 
+  mutate(Digit_Symbol_scale = scale(Digit_Symbol))
+
+df_E1 <- df %>%
+  mutate(
+    digit_group = if_else(Digit_Symbol_scale >= median(Digit_Symbol_scale, na.rm = TRUE), "High", "Low"),
+    digit_group = factor(digit_group, levels = c("Low", "High"))
+  )
+
+semmst_merged_data_E1_digit_median_split = df_E1 %>%
+  group_by(stim_type, digit_group) %>% 
+  pairwise_t_test(
+    estimate ~ order, 
+    paired = TRUE,
+    detailed = TRUE,
+    ) %>% 
+  ungroup() %>% 
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance() %>%
+  ungroup() %>% 
+  mutate(label = paste0("p=", signif(p.adj, 3)))
+semmst_merged_data_E1_digit_median_split
+
+#  stim_type digit_group estimate .y.      group1 group2    n1    n2 statistic         p    df conf.low conf.high method alternative   p.adj
+## 1 Exact     Low           0.221  estimate First  Repeat    28    28      8.04   1.22e-8    27   0.164      0.277 T-test two.sided   4.88e-8 ****       
+## 2 Exact     High          0.158  estimate First  Repeat    28    28      4.92   3.82e-5    27   0.0923     0.225 T-test two.sided   1.53e-4 ***        
+## 3 Lure      Low           0.0490 estimate First  Repeat    28    28      1.54   1.36e-1    27  -0.0165     0.115 T-test two.sided   5.44e-1 ns         
+## 4 Lure      High          0.0949 estimate First  Repeat    28    28      3.53   2   e-3    27   0.0397     0.150 T-test two.sided   8   e-3 **         
+
+```
+
+##### Supplementary Figure 2C.
+
+```{r}
+fig_mediansplit_CSI_dodge <- 0.8
+
+# OPTIONAL but recommended if you have multiple rows per ID/condition (e.g., ROI clusters):
+# collapse to one value per ID × stim_type × order × digit_group
+df_E1_collapsed <- df_E1 %>%
+  group_by(ID, stim_type, order, digit_group) %>%
+  mutate(stim_type = factor(as.character(stim_type),
+                       levels = c("Exact", "Lure"),
+                       labels = c("Exact", "Modified"))) %>% 
+  mutate(digit_group = factor(as.character(digit_group),
+                       levels = c("Low", "High"),
+                       labels = c("Low processing speed", "High processing speed")))
+
+# --- summary for bars (within-subject correction for stim_type+order, between = digit_group) ---
+fig_mediansplit_CSI_barsum <- Rmisc::summarySEwithin(
+  data       = df_E1_collapsed,
+  measurevar = "estimate",
+  withinvars = c("stim_type", "order"),
+  betweenvars = "digit_group",
+  idvar      = "ID",
+  na.rm      = TRUE
+)
+
+# --- paired tests: First vs Repeat within each stim_type × digit_group ---
+fig_mediansplit_CSI_stat.test <- df_E1_collapsed %>%
+  group_by(stim_type, digit_group) %>%
+  pairwise_t_test(
+    estimate ~ order,
+    paired = TRUE,
+    detailed = TRUE
+  ) %>%
+  ungroup() %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance("p.adj") %>%
+  mutate(
+    label = case_when(
+      p.adj < 0.001 ~ "p < .001",
+      p.adj < 0.01  ~ "p < .01",
+      p.adj < 0.05  ~ "p < .05",
+      TRUE          ~ paste0("p = ", sub("^0", "", sprintf("%.2f", p.adj)))
+    )
+  )
+
+# y positions per facet + stim_type
+fig_mediansplit_CSI_stat.test <- fig_mediansplit_CSI_stat.test %>%
+  left_join(
+    fig_mediansplit_CSI_barsum %>%
+      group_by(stim_type, digit_group) %>%
+      summarise(y.position = max(estimate + se, na.rm = TRUE) * 1.08, .groups = "drop"),
+    by = c("stim_type", "digit_group")
+  ) %>%
+  mutate(
+    stim_idx = as.numeric(stim_type),
+    xmin = stim_idx - fig_mediansplit_CSI_dodge/2,
+    xmax = stim_idx + fig_mediansplit_CSI_dodge/2
+  )
+
+# --- plot ---
+fig_mediansplit_CSI_plot <- ggplot(
+  fig_mediansplit_CSI_barsum,
+  aes(x = stim_type, y = estimate, fill = stim_type, group = order)
+) +
+  geom_col(
+    aes(alpha = order),
+    position = position_dodge(width = fig_mediansplit_CSI_dodge),
+    width = 0.65
+  ) +
+  geom_errorbar(
+    aes(ymin = estimate - se, ymax = estimate + se),
+    position = position_dodge(width = fig_mediansplit_CSI_dodge),
+    width = 0.15, size = 1.2
+  ) +
+  facet_wrap(~ digit_group) +
+  theme_classic(base_size = 13) +
+  labs(
+    x = "Condition during encoding",
+    y = "Mean % signal change",
+    fill = "Stimulus",
+    alpha = "Order"
+  ) +
+  scale_fill_manual(values = c(
+    "Exact"     = "#66BB6A",
+    "Modified"  = "#9575CD"
+  )) +
+  scale_alpha_manual(values = c(
+    "First"  = 0.95,
+    "Repeat" = 0.55
+  )) +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.14))) +
+  custom_theme +
+  guides(fill = "none") +
+  theme(
+    legend.position = c(0.88, 0.13)
+  )
+
+fig_mediansplit_CSI_plot +
+  ggpubr::stat_pvalue_manual(
+    fig_mediansplit_CSI_stat.test,
+    label = "label",
+    xmin = "xmin",
+    xmax = "xmax",
+    y.position = "y.position",
+    tip.length = 0.01,
+    hide.ns = TRUE,
+    inherit.aes = FALSE,
+    bracket.shorten = 1.2,
+    size = 5.4,
+    bracket.size = 1.0
+  )
+```
+
+
+```{r}
+text_base_export <- 40
+
+fig_mediansplit_CSI_plot_export <- fig_mediansplit_CSI_plot +
+  ggpubr::stat_pvalue_manual(
+    fig_mediansplit_CSI_stat.test,
+    label = "label",
+    xmin = "xmin",
+    xmax = "xmax",
+    y.position = "y.position",
+    tip.length = 0.01,
+    hide.ns = TRUE,
+    inherit.aes = FALSE,
+    bracket.shorten = 1.2,
+    size = 8.4,
+    bracket.size = 1.4
+  ) +
+  theme_classic(base_size = text_base_export) +
+  theme(
+    legend.position = c(0.88, 0.12),
+    legend.title = element_text(size = text_base_export * 0.88),
+    legend.text  = element_text(size = text_base_export * 0.90),
+    axis.text.x  = element_text(size = text_base_export * 0.90, margin = margin(t = 2)),
+    axis.text.y  = element_text(size = text_base_export * 0.90),
+    axis.title   = element_text(size = text_base_export * 1.05)
+  )
+
+ggsave(
+  "derivatives/figures/SI_figures/Figure2CSI.png",
+  plot   = fig_mediansplit_CSI_plot_export,
+  width  = 21, height = 13, units = "in",
+  dpi    = 300, bg = "white", device = "png"
+)
+
+```
+
+
+### Supplementary Results 2 - Anatomical power vs linear funcs
+
+```{r}
+# FILTER DATA
+semmst_merged_data_H1_clodis_powerfunc_anat = semmst_merged_data_filtered_anat %>% 
+  filter(task == "EncodingFirst") %>% 
+  filter(cope_name %in% c("AllFirst", "CloseRepeat", "DistantRepeat", "ExactRepeat")) %>% 
+  mutate(roi_cluster = paste(hemisphere, roi, sep = "_")) %>% 
+  mutate(cope_name = factor(cope_name, levels = c("ExactRepeat", "CloseRepeat", "DistantRepeat", "AllFirst"))) %>% 
+  mutate(roi_cluster = factor(roi_cluster))
+
+# OUTLIER
+semmst_merged_data_H1_clodis_powerfunc_anat %>%
+  group_by(cope_name, roi_cluster) %>%
+  identify_outliers(estimate) %>% 
+  dplyr::select(ID, is.outlier, is.extreme) %>% 
+  filter(is.extreme == TRUE)
+
+semmst_merged_data_H1_clodis_powerfunc_anat_nooutlier = semmst_merged_data_H1_clodis_powerfunc_anat 
+
+## EXPORT TO MATLAB
+export_matlab_anat <- semmst_merged_data_H1_clodis_powerfunc_anat_nooutlier %>%
+  filter(cope_name %in% c("AllFirst","ExactRepeat","CloseRepeat","DistantRepeat")) %>%
+  transmute(
+    Subj = ID,
+    ROI  = as.character(roi_cluster),
+    Cond = as.character(cope_name),
+    Beta = estimate
+  )
+
+write.csv(export_matlab_anat, "derivatives/transfer_raw_matlab_anat.csv", row.names = FALSE)
+
+```
+
+The rest of this analysis is in "scripts/smst_mr1_powerfunction_anat.m"
+
+#### Supplementary Figure 3
+
+Import outputs from "scripts/smst_mr1_powerfunction_anat.m"
+
+```{r}
+## HELPERS
+to_html_sup <- function(s) {
+  s %>%
+    str_replace_all("\\^\\s*\\(([^)]+)\\)", "<sup>\\1</sup>") %>%
+    str_replace_all("\\^\\s*([A-Za-z0-9\\.]+)", "<sup>\\1</sup>")
+}
+
+parse_roi_clean <- function(roi_string) {
+  parts <- str_split(roi_string, "_")[[1]]
+  core  <- parts[-1]               # drop L/R
+  core  <- core[-length(core)]     # drop last token
+  core  <- core[core != "HEAD"]    # remove HEAD token
+
+  paste(core, collapse = "-") %>%
+    gsub("HEAD", "", .) %>%
+    gsub("_", "-", .) %>%
+    gsub("DG", "DG-", .) %>%
+    gsub("CA2", "CA2/", .) %>% 
+    gsub("CA12", "CA1/2", .)
+}
+
+# Read-in + format
+roi_means_anat <- read_csv("derivatives/matlab_roi_means_anat.csv", show_col_types = FALSE) %>%
+  mutate(
+    hemi_lab  = if_else(str_starts(ROI, "L"), "Left hemisphere", "Right hemisphere"),
+    roi_type  = if_else(str_detect(ROI, "HEAD"), "head", "body"),
+    roi_clean = map_chr(ROI, parse_roi_clean)
+  )
+
+roi_clean_order <- unique(roi_means_anat$roi_clean)
+
+roi_means_anat <- roi_means_anat %>%
+  mutate(
+    roi_type  = factor(roi_type, levels = c("head", "body")),
+    hemi_lab  = factor(hemi_lab, levels = c("Left hemisphere", "Right hemisphere")),
+    roi_clean = factor(roi_clean, levels = roi_clean_order)
+  )
+
+curves_anat <- read_csv("derivatives/matlab_curve_predictions_anat.csv", show_col_types = FALSE) %>%
+  mutate(
+    is_winner = is_winner == 1,
+    linetype  = if_else(is_winner, "solid", "dashed"),
+    line_col  = if_else(is_winner, "winner", "other"),
+    hemi_lab  = if_else(str_starts(ROI, "L"), "Left hemisphere", "Right hemisphere"),
+    roi_type  = if_else(str_detect(ROI, "HEAD"), "head", "body"),
+    roi_clean = map_chr(ROI, parse_roi_clean)
+  ) %>%
+  mutate(
+    roi_type  = factor(roi_type, levels = c("head", "body")),
+    hemi_lab  = factor(hemi_lab, levels = c("Left hemisphere", "Right hemisphere")),
+    roi_clean = factor(roi_clean, levels = roi_clean_order)
+  )
+
+fit_long_anat <- read_csv("derivatives/matlab_fit_table_long_anat.csv", show_col_types = FALSE)
+
+# WINNER model
+labs_anat <- fit_long_anat %>%
+  filter(FitType == Winner) %>%                # <-- WINNER ONLY
+  distinct(ROI, .keep_all = TRUE) %>%
+  mutate(
+    hemi_lab  = if_else(str_starts(ROI, "L"), "Left hemisphere", "Right hemisphere"),
+    roi_type  = if_else(str_detect(ROI, "HEAD"), "head", "body"),
+    roi_clean = map_chr(ROI, parse_roi_clean),
+    roi_type  = factor(roi_type, levels = c("head", "body")),
+    hemi_lab  = factor(hemi_lab, levels = c("Left hemisphere", "Right hemisphere")),
+    roi_clean = factor(roi_clean, levels = roi_clean_order),
+    ann = paste0(
+      "<i>", to_html_sup(Model), "</i>",
+      "<br>Adj. R<sup>2</sup> = ", sprintf("%.3f", AdjR2)
+    )
+  )
+
+
+# Panels (HEAD and BODY)
+make_anat_panel <- function(which_type, title_txt,
+                            base_size = 14, point_size = 2.4,
+                            line_lwd = 1.0, ann_size = 4.0) {
+
+  ggplot() +
+    geom_hline(yintercept = 0, linetype = "dotted") +
+    geom_point(
+      data = roi_means_anat %>% filter(roi_type == which_type),
+      aes(x = x, y = mean_delta),
+      size = point_size
+    ) +
+    geom_errorbar(
+      data = roi_means_anat %>% filter(roi_type == which_type),
+      aes(x = x, ymin = mean_delta - sem_delta, ymax = mean_delta + sem_delta),
+      width = 0.05
+    ) +
+    geom_line(
+      data = curves_anat %>% filter(roi_type == which_type),
+      aes(
+        x = x, y = y,
+        group = interaction(ROI, model),
+        color = line_col,
+        linetype = linetype
+      ),
+      linewidth = line_lwd
+    ) +
+
+    # LEFT hemisphere annotation: top-left
+    ggtext::geom_richtext(
+      data = labs_anat %>% filter(roi_type == which_type, hemi_lab == "Left hemisphere"),
+      aes(x = -Inf, y = Inf, label = ann),
+      inherit.aes = FALSE,
+      hjust = -0.05, vjust = 1.7,
+      size = ann_size,
+      fill = NA, label.color = NA
+    ) +
+
+    # RIGHT hemisphere annotation: bottom-right
+    ggtext::geom_richtext(
+      data = labs_anat %>% filter(roi_type == which_type, hemi_lab == "Right hemisphere"),
+      aes(x = Inf, y = -Inf, label = ann),
+      inherit.aes = FALSE,
+      hjust = 1.05, vjust = -0.25,
+      size = ann_size,
+      fill = NA, label.color = NA
+    ) +
+
+    scale_color_manual(values = c(winner = "red", other = "grey35"), guide = "none") +
+    scale_linetype_identity() +
+    scale_x_continuous(breaks = 1:3, labels = c("Exact", "Close", "Distant")) +
+    facet_grid(rows = vars(roi_clean), cols = vars(hemi_lab), scales = "free_y") +
+    coord_cartesian(clip = "off") +
+    labs(
+      x = "Conditions of repeats during encoding",
+      y = "Mean % signal change<br>(corrected for first presentation baseline)",
+      title = title_txt
+    ) +
+    theme_classic(base_size = base_size) +
+    custom_theme +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      strip.background = element_blank(),
+      strip.text = element_text(face = "bold"),
+
+      # <-- bigger gap between the 2 hemisphere columns:
+      panel.spacing.x = unit(1.25, "lines"),
+      panel.spacing.y = unit(0.6, "lines"),
+
+      axis.title.y = ggtext::element_markdown(hjust = 0.5)
+    )
+}
+
+# VIEW
+p_head_view <- make_anat_panel("head", "Hippocampal head",
+                               base_size = 14, point_size = 2.4, line_lwd = 1.0, ann_size = 4.0)
+
+p_body_view <- make_anat_panel("body", "Hippocampal body",
+                               base_size = 14, point_size = 2.4, line_lwd = 1.0, ann_size = 4.0)
+
+supp_fig_anat_curves <- p_head_view | p_body_view
+supp_fig_anat_curves
+
+```
+
+
+```{r}
+p_head_export <- make_anat_panel("head", "Hippocampal head",
+                                 base_size = 24, point_size = 5.5, line_lwd = 2.6, ann_size = 9.5)
+
+p_body_export <- make_anat_panel("body", "Hippocampal body",
+                                 base_size = 24, point_size = 5.5, line_lwd = 2.6, ann_size = 9.5)
+
+supp_fig_anat_curves_export <- p_head_export | p_body_export
+
+ggsave(
+  "derivatives/figures/SI_figures/Figure3SI.png",
+  plot   = supp_fig_anat_curves_export,
+  width  = 32, height = 20.5, units = "in",
+  dpi    = 300, bg = "white", device = ragg::agg_png
+)
+
+```
+
+#### Supplementary Table 1.
+
+```{r}
+
+# read MATLAB output (anat)
+fit_long_anat <- read_csv("derivatives/matlab_fit_table_long_anat.csv", show_col_types = FALSE)
+
+#ROI label (same as earlier)
+make_roi_label <- function(roi_string) {
+  parts <- str_split(roi_string, "_", simplify = FALSE)[[1]]
+  hemi  <- if (length(parts) >= 1 && parts[1] == "L") "Left " else "Right "
+
+  core <- parts
+  if (length(core) >= 2) core <- core[-1]
+  if (length(core) >= 1) core <- core[-length(core)]
+  core <- core[core != "HEAD"]
+  core <- core[core != ""]
+  core <- str_replace_all(core, "CA23", "CA2/3")
+
+  paste0(hemi, paste(core, collapse = "-"))
+}
+
+# Excel strings
+to_excel_model <- function(s) {
+  s %>%
+    str_replace_all("\\+\\s*-", " - ") %>%
+    str_replace("f\\(x\\)=", "f(x) = ") %>%
+    str_replace_all("\\*", "×") %>%
+    str_squish()
+}
+
+# Build single long table (ROI only on first row per ROI)
+supp_table1_anat <- fit_long_anat %>%
+  mutate(
+    FitType2  = recode(FitType, Power2 = "Power", Linear = "Linear"),
+    Winner2   = recode(Winner,  Power2 = "Power", Linear = "Linear"),
+    is_winner = (FitType2 == Winner2),
+    FitType2  = factor(FitType2, levels = c("Power", "Linear")),
+    ROI_lab   = map_chr(ROI, make_roi_label)
+  ) %>%
+  arrange(ROI, FitType2) %>%
+  group_by(ROI) %>%
+  mutate(ROI_print = if_else(row_number() == 1, first(ROI_lab), "")) %>%
+  ungroup() %>%
+  transmute(
+    ROI        = ROI_print,
+    `Fit type` = as.character(FitType2),
+    Model      = to_excel_model(Model),
+    `Adj. R²`  = sprintf("%.3f", AdjR2),
+    `R²`       = sprintf("%.3f", R2),
+    RMSE       = sprintf("%.3f", RMSE),
+    SSE        = sprintf("%.3f", SSE),
+    DFE        = as.integer(DFE),
+    is_winner
+  )
+
+winner_rows <- which(supp_table1_anat$is_winner) + 1  # +1 for header row
+supp_table1_out <- supp_table1_anat %>% select(-is_winner)
+
+# Write APA Excel
+out_file <- "derivatives/figures/SI_figures/SupplementaryTable1.xlsx"
+
+wb <- createWorkbook()
+addWorksheet(wb, "SupplementaryTable1")
+showGridLines(wb, "SupplementaryTable1", showGridLines = FALSE)
+
+writeData(wb, "SupplementaryTable1", supp_table1_out, startRow = 1, startCol = 1, colNames = TRUE)
+
+n_data   <- nrow(supp_table1_out)
+n_col    <- ncol(supp_table1_out)
+last_row <- 1 + n_data
+
+# ---- styles
+base_style <- createStyle(
+  fontName = "Times New Roman", fontSize = 12,
+  halign = "left", valign = "center", wrapText = TRUE
+)
+
+header_style <- createStyle(
+  fontName = "Times New Roman", fontSize = 12,
+  textDecoration = "bold",
+  halign = "left", valign = "center",
+  border = c("top", "bottom"),
+  borderStyle = c("thick", "medium"),
+  borderColour = c("black", "black")
+)
+
+bottom_rule_style <- createStyle(
+  border = "bottom", borderStyle = "thick", borderColour = "black"
+)
+
+winner_style <- createStyle(textDecoration = "bold")
+model_italic <- createStyle(textDecoration = "italic")
+
+foot_style <- createStyle(
+  fontName = "Times New Roman", fontSize = 11,
+  halign = "left", valign = "top", wrapText = TRUE
+)
+
+# ---- apply base style
+addStyle(wb, "SupplementaryTable1", base_style,
+         rows = 1:last_row, cols = 1:n_col,
+         gridExpand = TRUE, stack = TRUE)
+
+# ---- header rules
+addStyle(wb, "SupplementaryTable1", header_style,
+         rows = 1, cols = 1:n_col,
+         gridExpand = TRUE, stack = TRUE)
+
+# ---- bottom rule
+addStyle(wb, "SupplementaryTable1", bottom_rule_style,
+         rows = last_row, cols = 1:n_col,
+         gridExpand = TRUE, stack = TRUE)
+
+# ---- bold winner rows
+if (length(winner_rows) > 0) {
+  addStyle(wb, "SupplementaryTable1", winner_style,
+           rows = winner_rows, cols = 1:n_col,
+           gridExpand = TRUE, stack = TRUE)
+}
+
+# ---- italicize MODEL column
+model_col <- which(names(supp_table1_out) == "Model")
+addStyle(wb, "SupplementaryTable1", model_italic,
+         rows = 2:last_row, cols = model_col,
+         gridExpand = TRUE, stack = TRUE)
+
+# ---- column widths + row heights
+setColWidths(wb, "SupplementaryTable1", cols = 1, widths = 22)     # ROI
+setColWidths(wb, "SupplementaryTable1", cols = 2, widths = 10)     # Fit type
+setColWidths(wb, "SupplementaryTable1", cols = 3, widths = 55)     # Model
+setColWidths(wb, "SupplementaryTable1", cols = 4:7, widths = 12)   # numeric cols
+setColWidths(wb, "SupplementaryTable1", cols = 8, widths = 8)      # DFE
+
+setRowHeights(wb, "SupplementaryTable1", rows = 2:last_row, heights = 24)
+
+# ---- footnote
+foot_txt <- paste0(
+  "Linear, linear fit; Power, power fit; RMSE, root mean squared error; ",
+  "SSE, sum of squares error; DFE, degrees of freedom error"
+)
+
+foot_row <- last_row + 2
+writeData(wb, "SupplementaryTable1", foot_txt, startRow = foot_row, startCol = 1, colNames = FALSE)
+mergeCells(wb, "SupplementaryTable1", cols = 1:n_col, rows = foot_row)
+addStyle(wb, "SupplementaryTable1", foot_style, rows = foot_row, cols = 1, stack = TRUE)
+setRowHeights(wb, "SupplementaryTable1", rows = foot_row, heights = 35)
+
+saveWorkbook(wb, out_file, overwrite = TRUE)
+out_file
+
+```
+
+
+### Supplementary Results 3 - anatomical masks
+
+```{r}
+
+# FILTER DATA
+semmst_merged_data_filtered_anat_H1 = semmst_merged_data_filtered_anat %>% 
+  filter(task == "Encoding") %>% 
+  filter(cope_name %in% c("LureFirst", "ExactFirst", "LureRepeat", "ExactRepeat")) %>% 
+  extract(
+    col = cope_name,
+    into = c("stim_type", "order"),
+    regex = "([A-Za-z]+?)(First|Repeat)$"
+  ) %>% 
+  mutate(
+    stim_type = as.factor(stim_type),
+    order = as.factor(order)
+  ) %>% 
+  mutate(stim_type = factor(stim_type, levels = c("Exact", "Lure"))) %>% 
+  mutate(
+    stim_type = factor(stim_type, levels = c("Exact", "Lure")),
+    order = factor(order),
+    roi_type = if_else(str_detect(roi, "HEAD"), "head", "body")
+  ) %>% 
+  mutate(roi = str_remove(roi, "^HEAD")) %>% 
+  mutate(roi = str_replace_all(roi, c("CA12" = "CA1", "DGCA3" = "DGCA23")))
+  
+
+# ASSUMPTION CHECKS
+## OUTLIER
+semmst_merged_data_filtered_anat_H1 %>%
+  group_by(stim_type, order, roi_type, roi, hemisphere) %>%
+  identify_outliers(estimate) %>% 
+  dplyr::select(ID, is.outlier, is.extreme) %>% 
+  filter(is.extreme==TRUE)
+
+semmst_merged_data_filtered_anat_H1_nooutlier = semmst_merged_data_filtered_anat_H1 %>%
+  group_by(stim_type, order, roi_type, roi, hemisphere) %>%
+  filter(! ID %in% c("sub-499854", "sub-982347")) %>%  #, " sub-012421", "sub-632012", "sub-800472")) %>% # c("sub-434971", "sub-982347")) %>%
+  ungroup()
+
+##NORMALITY
+semmst_merged_data_filtered_anat_H1_nooutlier %>% 
+  group_by(stim_type, order, roi_type) %>%
+  shapiro_test(estimate)
+
+# ANOVA
+semmst_merged_data_filtered_anat_H1_nooutlier_AOV = semmst_merged_data_filtered_anat_H1_nooutlier %>%
+  anova_test(dv = estimate, wid = ID, within = c(stim_type, order, roi_type, roi, hemisphere))#, covariate = c(NonWord_sum_scale, Digit_Symbol_scale))
+
+get_anova_table(semmst_merged_data_filtered_anat_H1_nooutlier_AOV)
+
+# REPORT                       Effect DFn DFd      F        p p<.05      ges
+## 2                                    order 1.00 27.00  7.018 0.013000     * 1.20e-02
+## 3                                 roi_type 1.00 27.00  6.161 0.020000     * 1.20e-02
+## 4                                      roi 1.62 43.73  8.448 0.002000     * 2.50e-02
+## 8                           order:roi_type 1.00 27.00 19.939 0.000128     * 1.40e-02
+## 9                            stim_type:roi 2.00 54.00  4.516 0.015000     * 2.00e-03
+## 10                               order:roi 2.00 54.00  4.942 0.011000     * 2.00e-03
+## 11                            roi_type:roi 2.00 54.00  4.526 0.015000     * 9.00e-03
+## 13                        order:hemisphere 1.00 27.00  8.986 0.006000     * 3.00e-03
+## 19                      order:roi_type:roi 2.00 54.00  6.649 0.003000     * 2.00e-03
+
+```
+
+#### Supplementary Figure 4.
+
+```{r}
+
+fig_dodge <- 0.8
+
+# within-subject summary per stim_type × order × roi_type × roi × hemisphere
+figSI_anat_encRS_barsum <- Rmisc::summarySEwithin(
+  data       = semmst_merged_data_filtered_anat_H1_nooutlier,
+  measurevar = "estimate",
+  withinvars = c("stim_type","order","roi_type","roi","hemisphere"),
+  idvar      = "ID",
+  na.rm      = TRUE
+) %>%
+  mutate(
+    stim_type  = factor(stim_type, levels = c("Exact", "Lure")),
+    order      = factor(order, levels = c("First", "Repeat")),
+    roi_type   = factor(roi_type, levels = c("head", "body")),
+    roi        = factor(roi),
+    hemisphere = factor(
+      hemisphere,
+      levels = c("L", "R"),
+      labels = c("Left hemisphere", "Right hemisphere")
+    )
+  )%>%
+  mutate(stim_type = factor(as.character(stim_type),
+                            levels = c("Exact","Lure"),
+                            labels = c("Exact","Modified")))
+
+make_panel <- function(df) {
+  ggplot(df, aes(
+    x = stim_type, y = estimate,
+    fill = stim_type,
+    alpha = order,
+    group = order
+  )) +
+    geom_col(position = position_dodge(width = fig_dodge), width = 0.65) +
+    geom_errorbar(
+      aes(ymin = estimate - se, ymax = estimate + se),
+      position = position_dodge(width = fig_dodge),
+      width = 0.15,
+      linewidth = 1.1
+    ) +
+    facet_grid(rows = vars(roi), cols = vars(hemisphere)) +
+    theme_classic(base_size = 13) +
+    labs(x = "Condition during encoding", y = "Mean % signal change", alpha = "Order") +
+    scale_fill_manual(values = c("Exact" = "#66BB6A", "Modified" = "#9575CD")) +
+    scale_alpha_manual(values = c("First" = 0.95, "Repeat" = 0.55)) +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.12))) +
+    guides(
+      fill  = "none",
+      alpha = guide_legend(title = "Order")
+    ) +
+    theme(
+      strip.background = element_blank(),
+      strip.text = element_text(face = "bold"),
+      panel.spacing = unit(0.6, "lines")
+    )
+}
+
+# Left panel (head): no legend
+p_head_figSI_anat_encRS <- figSI_anat_encRS_barsum %>%
+  filter(roi_type == "head") %>%
+  make_panel() +
+  ggtitle("Hippocampal head") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "none"
+  )
+
+# Right panel (body): legend inset top-right
+p_body_figSI_anat_encRS <- figSI_anat_encRS_barsum %>%
+  filter(roi_type == "body") %>%
+  make_panel() +
+  ggtitle("Hippocampal body") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position      = c(0.98, 0.98),
+    legend.justification = c(1, 1),
+    legend.background    = element_rect(fill = alpha("white", 0.75), colour = NA),
+    legend.key           = element_blank()
+  )
+
+# Combine as two columns (IMPORTANT: no guide collection)
+figSI_anat_encRS_plot <- (p_head_figSI_anat_encRS | p_body_figSI_anat_encRS)
+
+figSI_anat_encRS_plot
+
+```
+
+
+```{r}
+
+text_base_export <- 24  # 20–28 usually looks best for this many facets
+
+# IMPORTANT: do NOT set legend.position in the export theme
+export_theme <- theme_classic(base_size = text_base_export) +
+  theme(
+    axis.text.x   = element_text(size = text_base_export * 0.80, margin = margin(t = 6)),
+    axis.text.y   = element_text(size = text_base_export * 0.80),
+    axis.title.x  = element_text(size = text_base_export * 0.95, margin = margin(t = 10)),
+    axis.title.y  = element_text(size = text_base_export * 0.95, margin = margin(r = 10)),
+    strip.text    = element_text(size = text_base_export * 0.85, face = "bold"),
+    plot.title    = element_text(size = text_base_export * 1.05, face = "bold", hjust = 0.5),
+    legend.title  = element_text(size = text_base_export * 0.85),
+    legend.text   = element_text(size = text_base_export * 0.80),
+    panel.spacing = unit(0.8, "lines")
+  )
+
+# Apply export theme per panel + enforce legend behavior
+p_head_export <- p_head_figSI_anat_encRS &
+  export_theme &
+  theme(legend.position = "none")
+
+p_body_export <- p_body_figSI_anat_encRS &
+  export_theme &
+  theme(
+    legend.position      = c(0.98, 0.98),   # inside top-right of RIGHT panel
+    legend.justification = c(1, 1),
+    legend.background    = element_rect(fill = alpha("white", 0.75), colour = NA),
+    legend.key           = element_blank()
+  )
+
+figSI_anat_encRS_plot_export <- p_head_export | p_body_export
+
+ggsave(
+  "derivatives/figures/SI_figures/Figure4SI.png",
+  plot   = figSI_anat_encRS_plot_export,
+  width  = 23, height = 12, units = "in",
+  dpi    = 300, bg = "white", device = ragg::agg_png
+)
+
+```
+
+### Supplementary Results 4 - close vs distant REC
+
+```{r}
+
+semmst_merged_data_filtered_H4b_REC_clodis = semmst_merged_data_filtered %>% 
+  filter(task == "RecognitionRespCloDis") %>% 
+  filter(cope_name %in% c("DistantCR", "CloseCR"))
+
+# ASSUMPTION CHECKS
+## OUTLIER
+semmst_merged_data_filtered_H4b_REC_clodis %>%
+  group_by(cope_name, roi_cluster) %>%
+  identify_outliers(estimate) %>% 
+  dplyr::select(ID, roi_cluster, cope_name, is.outlier, is.extreme) %>% 
+  filter(is.extreme==TRUE)
+
+semmst_merged_data_filtered_H4b_REC_clodis_nooutlier = semmst_merged_data_filtered_H4b_REC_clodis %>%
+  ungroup()
+
+semmst_merged_H4b_REC_clodis_PWC = semmst_merged_data_filtered_H4b_REC_clodis_nooutlier %>%
+  group_by(roi_cluster) %>% 
+  pairwise_t_test(
+    estimate ~ cope_name, 
+    paired = TRUE,
+    detailed = TRUE,
+    ) %>% 
+  ungroup() %>% 
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance() %>%
+  ungroup() %>% 
+  mutate(label = paste0("p=", signif(p.adj, 3)))
+semmst_merged_H4b_REC_clodis_PWC
+
+
+# REP  roi_cluster               estimate .y.      group1  group2     n1    n2 statistic     p    df conf.low conf.high method alternative p.adj 
+## 1 L_HEAD_DGCA23_HEAD_SUB_14  -0.110  estimate CloseCR Distan…    30    30     -1.55 0.133    29   -0.255    0.0355 T-test two.sided   0.266 ns         
+## 2 R_HEAD_DGCA23_HEAD_SUB_15  -0.0498 estimate CloseCR Distan…    30    30     -1.07 0.294    29   -0.145    0.0455 T-test two.sided   0.588 ns
+
+
+```
+
+#### Supplementary Figure 5.
+
+```{r}
+
+# BARPLOT
+figSI_clodisREC_dodge <- 0.8
+
+figSI_clodisREC_barsum <- Rmisc::summarySEwithin(
+  data        = semmst_merged_data_filtered_H4b_REC_clodis,
+  measurevar  = "estimate",
+  withinvars  = c("cope_name", "roi_cluster"),
+  idvar       = "ID",
+  na.rm       = TRUE
+)
+
+figSI_clodisREC_roi_lab <- semmst_merged_data_filtered_H4_REC_conditions_nooutlier %>%
+  distinct(roi_cluster, hemisphere, roi, cluster, voxels) %>%
+  mutate(
+    roi_label = case_when(
+      roi == "HEAD_DGCA23_HEAD_SUB" & hemisphere == "R" ~ "Right DG-CA2/3-SUB",
+      roi == "HEAD_DGCA23_HEAD_SUB" & hemisphere == "L" ~ "Left DG-CA2/3-SUB",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  select(roi_cluster, roi_label)
+
+figSI_clodisREC_level_map <- c("CloseCR", "DistantCR")
+figSI_clodisREC_level_lab <- c("Close lure",   "Distant lure")
+
+figSI_clodisREC_barsum <- figSI_clodisREC_barsum %>%
+  mutate(cope_name = factor(cope_name, levels = figSI_clodisREC_level_map, labels = figSI_clodisREC_level_lab)) %>%
+  left_join(figSI_clodisREC_roi_lab, by = "roi_cluster")
+
+figSI_clodisREC_plot <- ggplot(figSI_clodisREC_barsum, aes(x = cope_name, y = estimate, fill = cope_name)) +
+  geom_col(position = position_dodge(width = figSI_clodisREC_dodge), width = 0.65) +
+  geom_errorbar(
+    aes(ymin = estimate - se, ymax = estimate + se),
+    position = position_dodge(width = figSI_clodisREC_dodge),
+    width = 0.15,
+    size = 1.2
+  ) +
+  facet_wrap(~ roi_label) +
+  theme_classic(base_size = 13) +
+  labs(x = "Condition during recognition", y = "Mean % signal change") +
+  scale_fill_manual(values = c(
+    "Close lure" = "#4477AA",
+    "Distant lure"   = "#DDCC77"
+  )) +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.12))) +
+  custom_theme +
+  guides(fill = "none")
+
+figSI_clodisREC_plot 
+
+```
+
+```{r}
+
+text_base_export=40
+figSI_clodisREC_plot_export <- figSI_clodisREC_plot +
+  theme_classic(base_size = text_base_export) +
+  theme(
+    axis.text.x  = element_text(size = text_base_export * 0.90, margin = margin(t = 2)),
+    axis.text.y  = element_text(size = text_base_export * 0.90),
+    axis.title   = element_text(size = text_base_export * 1.05),
+    strip.text = element_text(size = text_base_export * 0.95)
+  )
+
+ggsave(
+  "derivatives/figures/SI_figures/Figure5SI.png",
+  plot   = figSI_clodisREC_plot_export,
+  width  = 22, height = 14, units = "in",
+  dpi    = 300, bg = "white", device = "png"
+)
+
+```
+
+
+### Supplementary Results 5 - Behaviour wo. covariates and outlier
+
+```{r}
+semmst_behav_data_rec_LDI_ANOVA = semmst_behav_data_rec_summary %>% 
+  dplyr::select(ID, rec_dprime, close_dprime, distant_dprime) %>% 
+  gather("dprime_type", "dprime_value", rec_dprime:distant_dprime) %>% 
+  mutate(dprime_type = factor(dprime_type, levels = c("close_dprime", "rec_dprime", "distant_dprime"))) %>% 
+    left_join(semmst_behav_data_rec_filtered %>%  dplyr::select(ID, age, sex, education, Vocabulary, Digit_Symbol, NonWord_sum) %>% distinct(), by="ID")
+
+semmst_behav_data_rec_LDI_ANCOVA = semmst_behav_data_rec_LDI_ANOVA %>% 
+  left_join(semmst_behav_data_rec_filtered %>%  dplyr::select(ID, age, sex, education, Vocabulary, Digit_Symbol, NonWord_sum) %>% distinct(), by="ID") %>%
+  mutate(Vocabulary_scale = scale(Vocabulary)) %>% 
+  mutate(Digit_Symbol_scale = scale(Digit_Symbol)) %>% 
+  mutate(NonWord_sum_scale = scale(NonWord_sum)) %>% drop_na()
+ 
+# ASSUMPTION CHECKS
+## OUTLIER
+semmst_behav_data_rec_LDI_ANOVA %>%
+  group_by(dprime_type) %>%
+  identify_outliers(dprime_value)
+
+##NORMALITY
+semmst_behav_data_rec_LDI_ANOVA %>% 
+  group_by(dprime_type) %>%
+  shapiro_test(dprime_value) %>%  print(n=40)
+
+ggqqplot(semmst_behav_data_rec_LDI_ANOVA, "dprime_value", ggtheme = theme_bw()) +
+  facet_grid(. ~ dprime_type, labeller = "label_both")
+
+
+# ANOVA
+ANOVA_behav_data_rec_LDI = semmst_behav_data_rec_LDI_ANOVA %>%
+  anova_test(dv = dprime_value, wid = ID, within = c(dprime_type), covariate = c(sex, age))
+
+get_anova_table(ANOVA_behav_data_rec_LDI)
+
+# REPORT
+## dprime_type   2  54 159.192 2.28e-23     * 0.493
+
+```
+
+#### Supplementary Figure 6.
+
+```{r}
+# 1) Prep & adjustment (remove linear effects of covariates)
+figSI_outlier_plot_base <- semmst_behav_data_rec_LDI_ANOVA %>%
+  filter(!is.na(ID), !is.na(dprime_type), !is.na(dprime_value)) %>%
+  mutate(
+    dprime_type = factor(dprime_type),
+    sex = factor(sex)
+  )
+
+# order as: Close, Distant, Target
+figSI_outlier_contrast_order <- c("close_dprime", "distant_dprime", "rec_dprime")
+
+# order as: Close, Distant, Target
+figSI_outlier_contrast_order <- c("close_dprime", "distant_dprime", "rec_dprime")
+figSI_outlier_plot_base <- figSI_outlier_plot_base %>%
+  mutate(dprime_type = fct_relevel(dprime_type, figSI_outlier_contrast_order))
+
+# covariate-only model for adjustment
+figSI_outlier_mod_cov <- lm(dprime_value ~ sex + age,
+              data = figSI_outlier_plot_base)
+
+figSI_outlier_plot_base <- figSI_outlier_plot_base %>%
+  mutate(dprime_adj = dprime_value - predict(figSI_outlier_mod_cov, newdata = figSI_outlier_plot_base) + mean(dprime_value, na.rm = TRUE))
+
+# 2) Labels & colors
+figSI_outlier_x_lab_map <- c(
+  "close_dprime"   = "Close\nlure",
+  "distant_dprime" = "Distant\nlure",
+  "rec_dprime"  = "Foil"
+)
+
+# Paul Tol (muted): blue / yellow / red — CVD-safe, good in print & grayscale
+figSI_outlier_fill_vals <- c("close_dprime"="#4477AA", "distant_dprime"="#DDCC77", "rec_dprime"="#117733")
+
+# 3) Plot
+behav_figSI_outlier <- ggplot(figSI_outlier_plot_base, aes(x = dprime_type, y = dprime_adj, fill = dprime_type)) +
+  geom_boxplot(width = 0.6, outlier.alpha = 0.4, linewidth = 1.8, color = "black") +
+  stat_summary(fun = mean, geom = "point", shape = 21,  size = 2.2, fill = "white", color = "black") +
+  scale_x_discrete(labels = figSI_outlier_x_lab_map, drop = FALSE) +
+  scale_fill_manual(values = figSI_outlier_fill_vals, guide = "none") +
+  labs(
+    x = "Discriminability contrasts",
+    y = "Covariate-adjusted d'\n [p(\"old\"|target) - p(\"old\"|condition)]"
+  ) +
+  theme_classic(base_size = 14)
+
+behav_figSI_outlier
+
+```
+
+```{r}
+behav_figSI_outlier_export <- behav_figSI_outlier +
+  theme_classic(base_size = 40) +
+  theme(
+    axis.title = element_text(size = 42),
+    axis.text  = element_text(size = 34)
+  ) + labs(x = NULL)
+
+ggsave(
+  "derivatives/figures/SI_figures/Figure6SI.png",
+  plot   = behav_figSI_outlier_export,
+  width  = 16, height = 12, units = "in",
+  dpi    = 300,
+  bg     = "white",
+  device = "png"   # base png
+)
+```
+
+
+### Supplementary Results 6 - Encoding wo. covariates and outlier
+
+#### ANOVA
+
+```{r}
+# FILTER DATA
+semmst_merged_data_H1 = semmst_merged_data_filtered %>% 
+  filter(task == "Encoding") %>% 
+  filter(cope_name %in% c("LureFirst", "ExactFirst", "LureRepeat", "ExactRepeat")) %>% 
+  extract(
+    col = cope_name,
+    into = c("stim_type", "order"),
+    regex = "([A-Za-z]+?)(First|Repeat)$"
+  ) %>% 
+  mutate(
+    stim_type = as.factor(stim_type),
+    order = as.factor(order)
+  ) %>% 
+  mutate(stim_type = factor(stim_type, levels = c("Exact", "Lure")))
+
+# ASSUMPTION CHECKS
+## OUTLIER
+semmst_merged_data_H1 %>%
+  group_by(stim_type, order, roi_cluster) %>%
+  identify_outliers(estimate) %>% 
+  dplyr::select(ID, is.outlier, is.extreme) %>% 
+  filter(is.extreme==TRUE)
+
+semmst_merged_data_H1SI_nooutlier = semmst_merged_data_H1 %>%
+  group_by(stim_type, order, roi_cluster) %>%
+  #filter(! ID %in% c("sub-434971")) %>%  #, " sub-012421", "sub-632012", "sub-800472")) %>% # c("sub-434971", "sub-982347")) %>%
+  ungroup()
+
+##NORMALITY
+semmst_merged_data_H1SI_nooutlier %>% 
+  group_by(stim_type, order) %>%
+  shapiro_test(estimate)
+
+# ANOVA
+semmst_merged_data_H1SI_nooutlier_AOV = semmst_merged_data_H1SI_nooutlier %>%
+  anova_test(dv = estimate, wid = ID, within = c(stim_type, order, roi_cluster))#, covariate = c(NonWord_sum_scale, Digit_Symbol_scale))
+
+get_anova_table(semmst_merged_data_H1SI_nooutlier_AOV)
+
+# REPORT                       Effect DFn DFd      F        p p<.05      ges
+## 1                   stim_type   1  29 16.545 3.33e-04     * 3.30e-02
+## 2                       order   1  29 54.775 3.73e-08     * 1.07e-01
+## 4             stim_type:order   1  29  4.123 5.20e-02       1.60e-02
+```
+
+#### Correlation
+
+```{r}
+
+group_vars_H3SI <- c("ID", "mask_type", "space_type", "contrast", "roi_cluster")
+
+# baseline
+semmst_merged_data_H3SI_neural_ps = semmst_merged_data_filtered %>% 
+  filter(task %in% c("Encoding")) %>% 
+  filter(cope_name %in% c("ExactFirst", "ExactRepeat", "LureFirst","LureRepeat", "CloseFirst", "CloseRepeat", "DistantFirst", "DistantRepeat")) %>% 
+  dplyr::select(ID, space_type, cope_name, hemisphere, roi, mask_type, cluster, voxels, contrast, task, roi_cluster, roi_hemisphere, estimate, NonWord_sum_scale, Digit_Symbol_scale, rec_dprime:lure_incorrect) %>% 
+  group_by(across(all_of(group_vars_H3SI))) %>%
+  pivot_wider(names_from = cope_name, values_from = estimate, values_fill = NA_real_) %>%
+  mutate(
+    # --- Non-RS bias scores (Exact denominator) ---
+    LureBiasScore      = LureRepeat - ExactRepeat, 
+    CloseBiasScore     = CloseRepeat - ExactRepeat,
+    DistantBiasScore   = DistantRepeat - ExactRepeat
+  ) %>%
+  ungroup() 
+
+# 1) Filter to the Exact subset and define roi_group
+df_corr_input_all_SI <- semmst_merged_data_H3SI_neural_ps %>%
+  mutate(roi_group = roi_cluster) %>%
+  dplyr::select(ID, roi_group, roi, hemisphere, cluster, voxels, LureBiasScore, lure_dprime, NonWord_sum_scale, Digit_Symbol_scale) %>% 
+  ungroup()
+
+df_corr_input_all_SI_nooutlier <- df_corr_input_all_SI %>%
+  droplevels() %>% 
+  ungroup()
+
+# Fisher-z CI for Pearson r (95% hard-coded)
+pearson_ci <- function(r, n) {
+  z <- atanh(r)
+  se <- 1 / sqrt(n - 3)
+  zcrit <- qnorm(1 - (1 - 0.95) / 2)
+  c(low = tanh(z - zcrit * se), high = tanh(z + zcrit * se))
+}
+
+H3SI_corr_lure_simple <- df_corr_input_all_SI_nooutlier %>%
+  group_by(roi_group) %>%
+  group_modify(~{
+    d_all <- .x
+
+    # Pearson
+    d_s  <- d_all %>% dplyr::select(LureBiasScore, lure_dprime) %>% tidyr::drop_na()
+    ct_s <- cor.test(d_s$LureBiasScore, d_s$lure_dprime, method = "pearson")
+
+    r_s  <- unname(ct_s$estimate)
+    p_s  <- ct_s$p.value
+    n_s  <- nrow(d_s)
+    ci_s <- pearson_ci(r_s, n_s)
+
+    tibble::tibble(
+      n = n_s,
+      r = r_s,
+      p = p_s,
+      ci = sprintf("[%.3f, %.3f]", ci_s["low"], ci_s["high"])
+    )
+  }) %>%
+  ungroup() %>%
+  mutate(
+    p_adj = p.adjust(p, method = "bonferroni")
+  ) %>%
+  arrange(p_adj, p)
+
+H3SI_corr_lure_simple
+
+```
+
+
+
+#### Supplementary Figure 7B
+
+```{r}
+fig_corroutlier_BSI_dodge <- 0.8
+
+fig_corroutlier_BSI_barsum <- Rmisc::summarySEwithin(
+  data       = semmst_merged_data_H1SI_nooutlier,
+  measurevar = "estimate",
+  withinvars = c("stim_type","order","roi_cluster"),
+  idvar      = "ID",
+  na.rm      = TRUE
+) %>%
+  mutate(stim_type = factor(as.character(stim_type),
+                            levels = c("Exact","Lure"),
+                            labels = c("Exact","Modified")))
+
+fig_corroutlier_BSI_roi_lab <- semmst_merged_data_H1SI_nooutlier %>%
+  distinct(roi_cluster, hemisphere, roi, cluster, voxels) %>%
+  mutate(
+    roi_label = case_when(
+      roi == "HEAD_DGCA23_HEAD_SUB" & hemisphere == "R" ~ "Right DG-CA2/3-SUB cluster",
+      roi == "HEAD_DGCA23_HEAD_SUB" & hemisphere == "L" ~ "Left DG-CA2/3-SUB cluster",
+      TRUE ~ as.character(roi_cluster)
+    )
+  ) %>%
+  select(roi_cluster, roi_label)
+
+fig_corroutlier_BSI_barsum <- fig_corroutlier_BSI_barsum %>%
+  left_join(fig_corroutlier_BSI_roi_lab, by = "roi_cluster")
+
+# bar plot
+fig_corroutlier_BSI <- ggplot(fig_corroutlier_BSI_barsum, aes(
+  x = stim_type, y = estimate,
+  fill = stim_type,
+  group = order
+)) +
+  geom_col(aes(alpha = order),
+           position = position_dodge(width = fig_corroutlier_BSI_dodge),
+           width = 0.65) +
+  geom_errorbar(
+    aes(ymin = estimate - se, ymax = estimate + se),
+    position = position_dodge(width = fig_corroutlier_BSI_dodge),
+    width = 0.15,
+    size = 1.2
+  ) +
+  facet_wrap(~ roi_label) +
+  theme_classic(base_size = 13) +
+  labs(x = "Condition during encoding", y = "Mean % signal change", fill = "Stimulus", alpha = "Order") +
+  scale_fill_manual(values = c(
+    "Exact" = "#66BB6A",
+    "Modified"  = "#9575CD"
+  )) +
+  scale_alpha_manual(values = c(
+    "First"  = 0.95,
+    "Repeat" = 0.55
+  )) +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.12))) +
+  custom_theme +
+  guides(fill = "none")
+
+fig_corroutlier_BSI
+
+```
+
+
+
+```{r}
+text_base_export <- 40
+
+fig_corroutlier_BSI_export <- fig_corroutlier_BSI +
+  theme_classic(base_size = text_base_export) +
+  theme(
+    legend.position = c(0.88, 0.88),
+    legend.title = element_text(size = text_base_export * 0.88),
+    legend.text  = element_text(size = text_base_export * 0.90),
+    axis.text.x  = element_text(size = text_base_export * 0.90, margin = margin(t = 2)),
+    axis.text.y  = element_text(size = text_base_export * 0.90),
+    axis.title   = element_text(size = text_base_export * 1.05),
+    strip.text   = element_blank(),
+    panel.spacing.x = unit(4, "in")
+  )
+
+ggsave(
+  "derivatives/figures/SI_figures/Figure7BSI.png",
+  plot   = fig_corroutlier_BSI_export,
+  width  = 26, height = 13, units = "in",
+  dpi    = 300, bg = "white", device = "png"
+)
+
+```
+
+
+#### Supplementary Figure 7A
+
+```{r}
+
+ID_HI <- "sub-434971"
+
+semmst_merged_data_H1SI_nooutlier_data <- semmst_merged_data_H1SI_nooutlier %>%
+  filter(!is.na(estimate)) %>%
+  mutate(
+    highlight = (ID == ID_HI),
+
+    # Column labels you asked for
+    stim_col = case_when(
+      stim_type == "Exact" ~ "Exact repeat",
+      TRUE                ~ "Modified repeat"   # e.g., Lure -> Modified
+    ),
+
+    # Row labels you asked for
+    roi_row = case_when(
+      str_detect(roi_cluster, "^L$|L")  ~ "Left DG-CA2/3-Subiculum",
+      str_detect(roi_cluster, "^R$|R") ~ "Right DG-CA2/3-Subiculum",
+      TRUE ~ as.character(roi_cluster)
+    ),
+
+    order_row = case_when(
+      order == "First"  ~ "First presentation",
+      order == "Repeat" ~ "Repeat",
+      TRUE ~ as.character(order)
+    )
+  ) %>%
+  mutate(
+    stim_col  = factor(stim_col,  levels = c("Exact repeat", "Modified repeat")),
+    roi_row   = factor(roi_row,   levels = c("Left DG-CA2/3-Subiculum", "Right DG-CA2/3-Subiculum")),
+    order_row = factor(order_row, levels = c("First presentation", "Repeat"))
+  )
+
+# compute QQ points per facet (roi_row × order_row × stim_col) ---
+semmst_merged_data_H1SI_nooutlier_qq <- semmst_merged_data_H1SI_nooutlier_data %>%
+  group_by(roi_row, order_row, stim_col) %>%
+  arrange(estimate, .by_group = TRUE) %>%
+  mutate(theoretical = qnorm(ppoints(n()))) %>%
+  ungroup()
+
+# compute qqline (like R's qqline: through 25% and 75%) per facet ---
+semmst_merged_data_H1SI_nooutlier_lines <- semmst_merged_data_H1SI_nooutlier_qq %>%
+  group_by(roi_row, order_row, stim_col) %>%
+  summarise(
+    y25 = quantile(estimate, 0.25, na.rm = TRUE),
+    y75 = quantile(estimate, 0.75, na.rm = TRUE),
+    x25 = qnorm(0.25),
+    x75 = qnorm(0.75),
+    slope = (y75 - y25) / (x75 - x25),
+    intercept = y25 - slope * x25,
+    .groups = "drop"
+  )
+
+# plot (thin line, correct highlight, correct labels) ---
+fig_corroutlier_SIA_figure = ggplot(semmst_merged_data_H1SI_nooutlier_qq, aes(x = theoretical, y = estimate)) +
+  geom_point(size = 2.4, alpha = 0.75, colour = "black") +
+  geom_point(
+    data = dplyr::filter(semmst_merged_data_H1SI_nooutlier_qq, highlight),
+    size = 2.6, alpha = 0.95, colour = "red"
+  ) +
+  geom_abline(
+    data = semmst_merged_data_H1SI_nooutlier_lines,
+    aes(slope = slope, intercept = intercept),
+    linewidth = 1.2,
+    colour = "black"
+  ) +
+  facet_grid(roi_row + order_row ~ stim_col, labeller = label_value) +
+  labs(
+    x = "Theoretical quantiles",
+    y = "Sample quantiles (% signal change)"
+  ) +
+  theme_bw()
+
+fig_corroutlier_SIA_figure
+
+```
+
+```{r}
+
+text_base_export <- 34  # tweak (28–40); 34 usually good for dense facet grids
+
+fig_corroutlier_SIA_export <- fig_corroutlier_SIA_figure +
+  # bump dot sizes (both black + highlighted red)
+  geom_point(size = 7.1, alpha = 0.75, colour = "black") +
+  geom_point(
+    data = dplyr::filter(semmst_merged_data_H1SI_nooutlier_qq, highlight),
+    size = 10.3, alpha = 0.95, colour = "red"
+  ) +
+  # thicker qqline
+  geom_abline(
+    data = semmst_merged_data_H1SI_nooutlier_lines,
+    aes(slope = slope, intercept = intercept),
+    linewidth = 1.6,
+    colour = "black"
+  ) +
+  theme_bw(base_size = text_base_export) +
+  theme(
+    axis.text.x   = element_text(size = text_base_export * 0.85, margin = margin(t = 6)),
+    axis.text.y   = element_text(size = text_base_export * 0.85),
+    axis.title.x  = element_text(size = text_base_export * 0.95, margin = margin(t = 10)),
+    axis.title.y  = element_text(size = text_base_export * 0.95, margin = margin(r = 10)),
+    strip.text    = element_text(size = text_base_export * 0.80, face = "bold"),
+    panel.spacing = unit(0.65, "lines"),
+    plot.margin   = margin(12, 12, 12, 12)
+  )
+
+# install.packages("ragg")
+ggsave(
+  "derivatives/figures/SI_figures/Figure7ASI.png",
+  plot   = fig_corroutlier_SIA_export,
+  width  = 16, height = 26, units = "in",
+  dpi    = 300, bg = "white", device = ragg::agg_png
+)
+
+```
+
+
+#### Supplementary Figure 7C
+
+```{r}
+
+ID_HI <- "sub-434971"
+
+# 1) Long table (ALL trials only)
+fig_corroutlierCSI_df <- df_corr_input_all_SI_nooutlier %>%
+  dplyr::select(ID, roi_group, roi, hemisphere, bias = LureBiasScore, lure_dprime) %>%
+  tidyr::drop_na(bias, lure_dprime) %>%
+  dplyr::mutate(
+    hemi_lab = dplyr::recode(hemisphere, L = "Left", R = "Right"),
+    roi_clean = roi %>%
+      gsub("HEAD_", "", .) %>%
+      gsub("_", "-", .) %>%
+      gsub("2", "", .),
+    facet_lab = paste(hemi_lab, roi_clean)
+  )
+
+# 2) Facet labels (no stats)
+fig_corroutlierCSI_labs <- fig_corroutlierCSI_df %>%
+  dplyr::distinct(roi_group, facet_lab)
+
+# 3) Plot (base)
+fig_corroutlierCSI <- ggplot(
+  fig_corroutlierCSI_df %>% mutate(highlight = (ID == ID_HI)),
+  aes(bias, lure_dprime)
+) +
+  # all points
+  geom_point(
+    data = \(d) d %>% filter(!highlight),
+    alpha = 0.7, size = 4.5, colour = "grey20"
+  ) +
+  # highlighted point on top
+  geom_point(
+    data = \(d) d %>% filter(highlight),
+    alpha = 1, size = 6.2, colour = "red"
+  ) +
+  # regression line (single neutral colour)
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1.1, colour = "grey20") +
+  facet_wrap(
+    ~ roi_group, scales = "free",
+    labeller = labeller(roi_group = setNames(fig_corroutlierCSI_labs$facet_lab, fig_corroutlierCSI_labs$roi_group))
+  ) +
+  labs(
+    x = "Modified repeat - exact repeat estimates",
+    y = "d' (lures vs targets)"
+  ) +
+  theme_classic(base_size = 18) +
+  custom_theme +
+  theme(
+    panel.spacing = unit(4, "in")   # big gap like your 6A; reduce if too much
+  )
+
+fig_corroutlierCSI
+```
+
+
+```{r}
+text_base_export <- 40
+
+fig_corroutlierCSI_export <- fig_corroutlierCSI +
+  theme_classic(base_size = text_base_export) +
+  theme(
+    axis.text.x  = element_text(size = text_base_export * 0.90, margin = margin(t = 2)),
+    axis.text.y  = element_text(size = text_base_export * 0.90),
+    axis.title   = element_text(size = text_base_export * 1.05),
+    panel.spacing = unit(4, "in"),
+    strip.text = element_blank()
+  ) +
+  # make the line thicker for export (optional)
+  geom_smooth(method = "lm", se = FALSE, linewidth = 2.6, colour = "grey20")
+
+ggsave(
+  "derivatives/figures/SI_figures/Figure7CSI.png",
+  plot   = fig_corroutlierCSI_export,
+  width  = 26, height = 12, units = "in",
+  dpi    = 300, bg = "white", device = "png"
+)
+```
+
+
+
